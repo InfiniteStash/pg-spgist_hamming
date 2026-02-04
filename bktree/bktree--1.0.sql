@@ -83,3 +83,25 @@ CREATE OPERATOR <-> (
 	RIGHTARG = int8,
 	PROCEDURE = bktree_get_distance
 	);
+
+
+-- Low-level batch search function (takes index OID directly)
+-- Returns (target_hash, match_hash, match_tid) for all matches
+CREATE OR REPLACE FUNCTION bktree_batch_search(
+	index_oid oid,
+	targets int8[],
+	distance int8
+) RETURNS TABLE(target_hash int8, match_hash int8, match_tid tid) AS
+'MODULE_PATHNAME','bktree_batch_search'
+LANGUAGE C STABLE STRICT;
+
+-- Ergonomic batch search function: bktree_search(table, column, targets, distance)
+-- Finds the SP-GiST index automatically
+CREATE OR REPLACE FUNCTION bktree_search(
+	table_name regclass,
+	column_name name,
+	targets int8[],
+	distance int8
+) RETURNS TABLE(target_hash int8, match_hash int8, match_tid tid) AS
+'MODULE_PATHNAME','bktree_search'
+LANGUAGE C STABLE STRICT;

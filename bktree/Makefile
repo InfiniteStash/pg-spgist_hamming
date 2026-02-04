@@ -1,7 +1,7 @@
 
 
 MODULE_big = bktree
-OBJS = bktree.o bktree_utils.o
+OBJS = bktree.o bktree_utils.o bktree_batch.o
 
 # Optimization: x86-64-v2 guarantees hardware POPCNT for hamming distance
 PG_CFLAGS = -O2 -march=x86-64-v2
