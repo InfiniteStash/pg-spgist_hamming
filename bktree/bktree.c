@@ -35,7 +35,7 @@ Datum bktree_get_distance(PG_FUNCTION_ARGS);
 #define int_min(a, b) (((a) < (b)) ? (a) : (b))
 #define int_max(a, b) (((a) > (b)) ? (a) : (b))
 
-static int64_t
+static inline int64_t
 f_hamming(int64_t a_int, int64_t b_int)
 {
 	/*
