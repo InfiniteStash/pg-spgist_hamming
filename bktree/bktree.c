@@ -226,19 +226,18 @@ bktree_inner_consistent(PG_FUNCTION_ARGS)
 	int minDistance;
 	int maxDistance;
 
+	/* Use stack allocation - max 65 nodes, avoid palloc overhead */
+	int stackNodes[65];
+	int nNodes = 0;
+
 	fprintf_to_ereport("bktree_inner_consistent");
-
-	out->nodeNumbers = (int *) palloc(sizeof(int) * in->nNodes);
-
-	// I don't know if this is zeroed automatically
-	out->nNodes = 0;
-
 
 	if (in->allTheSame)
 	{
 		fprintf_to_ereport("in->allTheSame is true");
 		/* Report that all nodes should be visited */
 		out->nNodes = in->nNodes;
+		out->nodeNumbers = (int *) palloc(sizeof(int) * in->nNodes);
 		for (i = 0; i < in->nNodes; i++)
 			out->nodeNumbers[i] = i;
 		PG_RETURN_VOID();
@@ -250,11 +249,10 @@ bktree_inner_consistent(PG_FUNCTION_ARGS)
 		switch (in->scankeys[i].sk_strategy)
 		{
 			case RTLeftStrategyNumber:
-				// The argument is a instance of bktree_area
+				/* The argument is an instance of bktree_area */
 				query = DatumGetHeapTupleHeader(in->scankeys[i].sk_argument);
 				queryTargetValue = DatumGetInt64(GetAttributeByNum(query, 1, &isNull));
 				queryDistance = DatumGetInt64(GetAttributeByNum(query, 2, &isNull));
-
 
 				Assert(in->hasPrefix);
 
@@ -263,36 +261,33 @@ bktree_inner_consistent(PG_FUNCTION_ARGS)
 				fprintf_to_ereport("RTLeftStrategyNumber search for %ld with distance of %ld", queryTargetValue, queryDistance);
 				fprintf_to_ereport("Nodes: current %016x, target %016x, distance %d", DatumGetInt64(in->prefixDatum), queryTargetValue, distance);
 
-				// We want to proceed down into child-nodes that are at distances
-				// hamming(search_hash, node_hash) - search distance -> hamming(search_hash, node_hash) + search distance
-				// from the current node.
-				// As such, we only need to perform one distance op, and just report to search
-				// the relevant nodes.
-
+				/*
+				 * We want to proceed down into child-nodes that are at distances
+				 * hamming(search_hash, node_hash) - search_distance to
+				 * hamming(search_hash, node_hash) + search_distance from the current node.
+				 */
 				Assert(distance >= 0);
 				Assert(distance <= 64);
 
-				minDistance = int_max(distance-queryDistance,  0);
-				maxDistance = int_min(distance+queryDistance, 64);
+				minDistance = int_max(distance - queryDistance, 0);
+				maxDistance = int_min(distance + queryDistance, 64);
 
 				for (int j = minDistance; j <= maxDistance; j++)
 				{
-
-					fprintf_to_ereport("Out Nodes: %d, inserting node number %d", out->nNodes, j);
-					out->nodeNumbers[out->nNodes] = j;
-					out->nNodes++;
+					fprintf_to_ereport("Out Nodes: %d, inserting node number %d", nNodes, j);
+					stackNodes[nNodes++] = j;
 				}
 				break;
 
 			case RTOverLeftStrategyNumber:
-				// With a search distance of 0, we just
-				// calculate the node->child object distance, and return the node
-				// at that distance.
+				/*
+				 * With a search distance of 0, we just calculate the
+				 * node->child object distance, and return the node at that distance.
+				 */
 				fprintf_to_ereport("bktree_inner_consistent RTEqualStrategyNumber");
 				distance = f_hamming(DatumGetInt64(in->prefixDatum), DatumGetInt64(in->scankeys[i].sk_argument));
 
-				out->nodeNumbers[out->nNodes] = distance;
-				out->nNodes++;
+				stackNodes[nNodes++] = distance;
 				break;
 
 			default:
@@ -300,6 +295,19 @@ bktree_inner_consistent(PG_FUNCTION_ARGS)
 				break;
 		}
 	}
+
+	/* Allocate exactly the size needed and copy from stack */
+	out->nNodes = nNodes;
+	if (nNodes > 0)
+	{
+		out->nodeNumbers = (int *) palloc(sizeof(int) * nNodes);
+		memcpy(out->nodeNumbers, stackNodes, sizeof(int) * nNodes);
+	}
+	else
+	{
+		out->nodeNumbers = NULL;
+	}
+
 	PG_RETURN_VOID();
 }
 
