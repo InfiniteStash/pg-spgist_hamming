@@ -3,6 +3,9 @@
 /results/
 /tmp_check/
 /benchmark/
-*.so
 *.o
+*.so
 *.bc
+*.a
+*.pc
+regression.*
