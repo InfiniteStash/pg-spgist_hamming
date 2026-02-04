@@ -35,6 +35,9 @@ Datum bktree_get_distance(PG_FUNCTION_ARGS);
 #define int_min(a, b) (((a) < (b)) ? (a) : (b))
 #define int_max(a, b) (((a) > (b)) ? (a) : (b))
 
+/* Number of pivot candidates to evaluate during picksplit */
+#define PIVOT_SAMPLE_SIZE 32
+
 static inline int64_t
 f_hamming(int64_t a_int, int64_t b_int)
 {
@@ -102,45 +105,101 @@ bktree_choose(PG_FUNCTION_ARGS)
 }
 
 
+/*
+ * Evaluate a pivot candidate. Higher score = better pivot.
+ * Scores by counting distinct distance buckets and penalizing large buckets.
+ */
+static int
+evaluate_pivot(Datum *datums, int nTuples, int pivotIndex)
+{
+	int64_t pivot_hash = DatumGetInt64(datums[pivotIndex]);
+	int bucket_counts[65] = {0};
+	int distinct_buckets = 0;
+	int max_bucket = 0;
+	int i;
+
+	for (i = 0; i < nTuples; i++)
+	{
+		int distance = f_hamming(DatumGetInt64(datums[i]), pivot_hash);
+		if (bucket_counts[distance] == 0)
+			distinct_buckets++;
+		bucket_counts[distance]++;
+		if (bucket_counts[distance] > max_bucket)
+			max_bucket = bucket_counts[distance];
+	}
+
+	/* More distinct buckets = better, large max bucket = worse */
+	return distinct_buckets * nTuples - max_bucket;
+}
+
 Datum
 bktree_picksplit(PG_FUNCTION_ARGS)
 {
 	spgPickSplitIn *in = (spgPickSplitIn *) PG_GETARG_POINTER(0);
 	spgPickSplitOut *out = (spgPickSplitOut *) PG_GETARG_POINTER(1);
 	int i;
+	int bestIndex = 0;
+	int64_t this_node_hash;
 
-	// Since the concept of "best" isn't really a thing with BK-trees,
-	// we just pick one of the input nodes at random to assign as the node
-	// hash, against which to sort the child items.
-	//
-	// TODO: Rewrite this to chose the input datum
-	//       that produces the most child-node branches.
-	int bestIndex = in->nTuples / 2;
-	int64_t this_node_hash = DatumGetInt64(in->datums[bestIndex]);
+#if PIVOT_SAMPLE_SIZE > 0
+	/*
+	 * Sample up to PIVOT_SAMPLE_SIZE candidates and pick the one that
+	 * produces the most distinct distance buckets. This improves tree
+	 * balance without excessive overhead.
+	 */
+	int bestScore = 0;
 
-	fprintf_to_ereport("bktree_picksplit across %d tuples, with child-node count of %d (bestindex %d), on value %016x", in->nTuples, in->nTuples, bestIndex, this_node_hash);
+	if (in->nTuples <= PIVOT_SAMPLE_SIZE)
+	{
+		/* Evaluate all tuples if we have few enough */
+		for (i = 0; i < in->nTuples; i++)
+		{
+			int score = evaluate_pivot(in->datums, in->nTuples, i);
+			if (score > bestScore)
+			{
+				bestScore = score;
+				bestIndex = i;
+			}
+		}
+	}
+	else
+	{
+		/* Sample evenly across the input */
+		int step = in->nTuples / PIVOT_SAMPLE_SIZE;
+		for (i = 0; i < PIVOT_SAMPLE_SIZE; i++)
+		{
+			int candidateIndex = i * step;
+			int score = evaluate_pivot(in->datums, in->nTuples, candidateIndex);
+			if (score > bestScore)
+			{
+				bestScore = score;
+				bestIndex = candidateIndex;
+			}
+		}
+	}
+#else
+	/* Simple pivot selection: just pick the middle element */
+	bestIndex = in->nTuples / 2;
+#endif
+
+	this_node_hash = DatumGetInt64(in->datums[bestIndex]);
+
+	fprintf_to_ereport("bktree_picksplit across %d tuples, bestIndex %d, value %016lx",
+					   in->nTuples, bestIndex, this_node_hash);
 
 	out->hasPrefix = true;
 	out->prefixDatum = in->datums[bestIndex];
-	fprintf_to_ereport("Get data value: %ld, %ld", DatumGetInt64(in->datums[bestIndex]), out->prefixDatum);
 
 	out->mapTuplesToNodes = palloc(sizeof(int)   * in->nTuples);
 	out->leafTupleDatums  = palloc(sizeof(Datum) * in->nTuples);
-	// out->nodeLabels       = palloc(sizeof(Datum) * in->nTuples);
 	out->nodeLabels       = NULL;
 
-	// Allow edit distances of 0 - 64 inclusive
-	// since SP-GiST cannot store items on inner tuples, we
-	// have to allow an edit-distance of zero for the pointer
-	// to the leaf node containing the hash the innter-tuple is
-	// labeled with.
+	/* Allow edit distances of 0 - 64 inclusive */
 	out->nNodes = 65;
 
 	for (i = 0; i < in->nTuples; i++)
 	{
-		Datum current = in->datums[i];
-		int64_t datum_hash = DatumGetInt64(current);
-		int distance = f_hamming(datum_hash, this_node_hash);
+		int distance = f_hamming(DatumGetInt64(in->datums[i]), this_node_hash);
 
 		Assert(distance >= 0);
 		Assert(distance <= 64);
