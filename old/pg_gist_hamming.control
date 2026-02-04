@@ -1,5 +1,0 @@
-# pg_gist_hamming extension
-comment = 'support for indexing common datatypes in GiST'
-default_version = '1.0'
-module_pathname = '$libdir/pg_gist_hamming'
-relocatable = true
