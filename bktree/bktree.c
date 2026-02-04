@@ -216,11 +216,11 @@ bktree_inner_consistent(PG_FUNCTION_ARGS)
 				minDistance = int_max(distance-queryDistance,  0);
 				maxDistance = int_min(distance+queryDistance, 64);
 
-				for (i = minDistance; i <= maxDistance; i++)
+				for (int j = minDistance; j <= maxDistance; j++)
 				{
 
-					fprintf_to_ereport("Out Nodes: %d, inserting node number %d", out->nNodes, i);
-					out->nodeNumbers[out->nNodes] = i;
+					fprintf_to_ereport("Out Nodes: %d, inserting node number %d", out->nNodes, j);
+					out->nodeNumbers[out->nNodes] = j;
 					out->nNodes++;
 				}
 				break;
@@ -232,8 +232,9 @@ bktree_inner_consistent(PG_FUNCTION_ARGS)
 				fprintf_to_ereport("bktree_inner_consistent RTEqualStrategyNumber");
 				distance = f_hamming(DatumGetInt64(in->prefixDatum), DatumGetInt64(in->scankeys[i].sk_argument));
 
-				out->nNodes++;
 				out->nodeNumbers[out->nNodes] = distance;
+				out->nNodes++;
+				break;
 
 			default:
 				elog(ERROR, "unrecognized strategy number: %d", in->scankeys[i].sk_strategy);
