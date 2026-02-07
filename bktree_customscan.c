@@ -102,6 +102,40 @@ typedef struct ColumnMapping
 } ColumnMapping;
 
 /*
+ * Private data stored in CustomScan->custom_private.
+ * Stored as a List for serialization, but accessed via helper functions.
+ *
+ * List structure:
+ *   [0] = indexOid (Const OID)
+ *   [1] = indexedAttno (Const INT2)
+ *   [2] = innerRelid (Const INT4)
+ *   [3] = outerVarAttno (Const INT2)
+ *   [4] = distanceExpr (Expr node)
+ *   [5] = outerRelid (Const INT4)
+ *   [6..] = column mappings as pairs of (varno INT4, varattno INT2)
+ */
+#define PRIVATE_INDEX_OID		0
+#define PRIVATE_INDEXED_ATTNO	1
+#define PRIVATE_INNER_RELID		2
+#define PRIVATE_OUTER_VAR_ATTNO	3
+#define PRIVATE_DISTANCE_EXPR	4
+#define PRIVATE_OUTER_RELID		5
+#define PRIVATE_COL_MAPPINGS	6	/* Start of column mapping pairs */
+
+/* Helper to extract Const value from custom_private */
+static inline Datum
+private_get_datum(List *private, int index)
+{
+	Const *c = (Const *) list_nth(private, index);
+	Assert(IsA(c, Const) && !c->constisnull);
+	return c->constvalue;
+}
+
+#define PRIVATE_GET_OID(priv, idx)		DatumGetObjectId(private_get_datum(priv, idx))
+#define PRIVATE_GET_INT32(priv, idx)	DatumGetInt32(private_get_datum(priv, idx))
+#define PRIVATE_GET_INT16(priv, idx)	DatumGetInt16(private_get_datum(priv, idx))
+
+/*
  * Custom scan state for execution
  */
 typedef struct BktreeBatchJoinState
@@ -110,7 +144,6 @@ typedef struct BktreeBatchJoinState
 
 	/* Outer scan state */
 	PlanState  *outerPlan;
-	bool		outer_exhausted;
 
 	/* Batch search state */
 	Relation	index;
@@ -120,7 +153,8 @@ typedef struct BktreeBatchJoinState
 	int64		distance;
 	ExprState  *distanceExprState;
 
-	/* Results */
+	/* Results - allocated in batchContext for easy reset on rescan */
+	MemoryContext batchContext;
 	BatchResult *results;
 	int			nresults;
 	int			curr_result;
@@ -365,20 +399,15 @@ match_bktree_join_clause(PlannerInfo *root,
 	/* Must be an operator expression */
 	if (!IsA(rinfo->clause, OpExpr))
 	{
-		elog(DEBUG1, "bktree: clause is not OpExpr (tag=%d)", nodeTag(rinfo->clause));
 		return false;
 	}
 
 	op = (OpExpr *) rinfo->clause;
 	opno = op->opno;
 
-	elog(DEBUG1, "bktree: checking opno %u vs bktree op %u",
-		 opno, bktree_containment_op_oid());
-
 	/* Check if it's the <@ operator */
 	if (opno != bktree_containment_op_oid())
 	{
-		elog(DEBUG1, "bktree: operator mismatch");
 		return false;
 	}
 
@@ -389,28 +418,21 @@ match_bktree_join_clause(PlannerInfo *root,
 	leftarg = linitial(op->args);
 	rightarg = lsecond(op->args);
 
-	elog(DEBUG1, "bktree: leftarg type=%d, rightarg type=%d",
-		 nodeTag(leftarg), nodeTag(rightarg));
-
 	/*
 	 * Left arg should be a Var from innerrel matching the indexed column.
 	 */
 	if (!IsA(leftarg, Var))
 	{
-		elog(DEBUG1, "bktree: leftarg is not Var");
 		return false;
 	}
 
 	indexedVar = (Var *) leftarg;
 	if (!bms_is_member(indexedVar->varno, innerrel->relids))
 	{
-		elog(DEBUG1, "bktree: leftarg varno %d not in innerrel", indexedVar->varno);
 		return false;
 	}
 	if (indexedVar->varattno != indexedAttno)
 	{
-		elog(DEBUG1, "bktree: leftarg attno %d != indexed attno %d",
-			 indexedVar->varattno, indexedAttno);
 		return false;
 	}
 
@@ -423,18 +445,13 @@ match_bktree_join_clause(PlannerInfo *root,
 	 */
 	bktree_area_oid = bktree_area_type_oid();
 
-	elog(DEBUG1, "bktree: rightarg after strip type=%d", nodeTag(rightarg));
-
 	/* Strip any RelabelType nodes */
 	while (IsA(rightarg, RelabelType))
 		rightarg = (Node *) ((RelabelType *) rightarg)->arg;
 
-	elog(DEBUG1, "bktree: rightarg after RelabelType strip type=%d", nodeTag(rightarg));
-
 	/* Check for RowExpr (explicit tuple construction) */
 	if (IsA(rightarg, RowExpr))
 	{
-		elog(DEBUG1, "bktree: rightarg is RowExpr");
 		rowexpr = (RowExpr *) rightarg;
 		return extract_from_rowexpr(rowexpr, outerrel, outerVar, distanceExpr);
 	}
@@ -443,16 +460,12 @@ match_bktree_join_clause(PlannerInfo *root,
 	if (IsA(rightarg, CoerceViaIO))
 	{
 		CoerceViaIO *coerce = (CoerceViaIO *) rightarg;
-		elog(DEBUG1, "bktree: rightarg is CoerceViaIO, resulttype=%u, arg type=%d",
-			 coerce->resulttype, nodeTag(coerce->arg));
 		if (coerce->resulttype == bktree_area_oid && IsA(coerce->arg, RowExpr))
 		{
 			rowexpr = (RowExpr *) coerce->arg;
 			return extract_from_rowexpr(rowexpr, outerrel, outerVar, distanceExpr);
 		}
 	}
-
-	elog(DEBUG1, "bktree: rightarg pattern not matched");
 	return false;
 }
 
@@ -473,21 +486,15 @@ is_bktree_batch_join(PlannerInfo *root,
 	/* Check outer is UNNEST function scan */
 	if (!is_unnest_function_scan(root, outerrel))
 	{
-		elog(DEBUG1, "bktree: outer is not UNNEST function scan");
 		return false;
 	}
-
-	elog(DEBUG1, "bktree: found UNNEST function scan");
 
 	/* Check inner has bktree index */
 	indexOid = find_bktree_index_for_rel(innerrel, &indexedAttno);
 	if (!OidIsValid(indexOid))
 	{
-		elog(DEBUG1, "bktree: no bktree index found on inner rel");
 		return false;
 	}
-
-	elog(DEBUG1, "bktree: found bktree index %u on attno %d", indexOid, indexedAttno);
 
 	info->indexOid = indexOid;
 	info->indexedAttno = indexedAttno;
@@ -498,20 +505,14 @@ is_bktree_batch_join(PlannerInfo *root,
 	{
 		RestrictInfo *rinfo = lfirst(lc);
 
-		elog(DEBUG1, "bktree: checking restrictinfo, clause type = %d",
-			 nodeTag(rinfo->clause));
-
 		if (match_bktree_join_clause(root, rinfo, innerrel, outerrel,
 									 indexedAttno, &info->distanceExpr,
 									 &info->outerVar))
 		{
 			info->joinClause = rinfo;
-			elog(DEBUG1, "bktree: matched join clause!");
 			return true;
 		}
 	}
-
-	elog(DEBUG1, "bktree: no matching join clause found");
 	return false;
 }
 
@@ -589,25 +590,18 @@ create_bktree_batch_join_path(PlannerInfo *root,
 	BktreeBatchJoinPath *pathnode;
 	Path	   *outerpath;
 
-	elog(DEBUG1, "bktree: create_bktree_batch_join_path called");
-
 	/* Get cheapest outer path */
 	outerpath = outerrel->cheapest_total_path;
 	if (outerpath == NULL)
 	{
-		elog(DEBUG1, "bktree: no cheapest outer path");
 		return;
 	}
 
 	/* Limit to MAX_BATCH_TARGETS rows */
 	if (outerrel->rows > MAX_BATCH_TARGETS)
 	{
-		elog(DEBUG1, "bktree: too many outer rows: %f > %d",
-			 outerrel->rows, MAX_BATCH_TARGETS);
 		return;
 	}
-
-	elog(DEBUG1, "bktree: outer rows = %f", outerrel->rows);
 
 	/* Create the custom path */
 	pathnode = palloc0(sizeof(BktreeBatchJoinPath));
@@ -637,15 +631,8 @@ create_bktree_batch_join_path(PlannerInfo *root,
 	/* Compute costs - use joinrel->rows for consistent row estimate */
 	cost_bktree_batch_join(root, pathnode, joinrel, outerrel, innerrel);
 
-	elog(DEBUG1, "bktree: created path with cost %.2f..%.2f rows=%.0f",
-		 pathnode->cpath.path.startup_cost,
-		 pathnode->cpath.path.total_cost,
-		 pathnode->cpath.path.rows);
-
 	/* Add the path to the joinrel */
 	add_path(joinrel, &pathnode->cpath.path);
-
-	elog(DEBUG1, "bktree: path added to joinrel");
 }
 
 /*
@@ -712,58 +699,8 @@ bktree_batch_join_plan(PlannerInfo *root,
 	ListCell   *lc;
 	int			resno;
 
-	elog(DEBUG1, "bktree: plan - entered, tlist length=%d, clauses length=%d",
-		 list_length(tlist), list_length(clauses));
-
-	/* Log incoming tlist */
-	resno = 0;
-	foreach(lc, tlist)
-	{
-		TargetEntry *tle = lfirst(lc);
-		elog(DEBUG1, "bktree: plan - tlist[%d] nodeTag=%d, resno=%d, resname=%s",
-			 resno, nodeTag(tle->expr), tle->resno,
-			 tle->resname ? tle->resname : "(null)");
-		if (IsA(tle->expr, Var))
-		{
-			Var *v = (Var *) tle->expr;
-			elog(DEBUG1, "bktree: plan - tlist[%d] is Var: varno=%d, varattno=%d",
-				 resno, v->varno, v->varattno);
-		}
-		resno++;
-	}
-
-	/* Log clauses */
-	resno = 0;
-	foreach(lc, clauses)
-	{
-		Node *clause = lfirst(lc);
-		elog(DEBUG1, "bktree: plan - clause[%d] nodeTag=%d", resno, nodeTag(clause));
-		resno++;
-	}
-
-	/* Log distanceExpr */
-	elog(DEBUG1, "bktree: plan - distanceExpr nodeTag=%d",
-		 path->distanceExpr ? nodeTag(path->distanceExpr) : -1);
-	if (path->distanceExpr && IsA(path->distanceExpr, Const))
-	{
-		Const *c = (Const *) path->distanceExpr;
-		elog(DEBUG1, "bktree: plan - distanceExpr is Const, consttype=%u, isnull=%d",
-			 c->consttype, c->constisnull);
-	}
-	else if (path->distanceExpr && IsA(path->distanceExpr, Var))
-	{
-		Var *v = (Var *) path->distanceExpr;
-		elog(DEBUG1, "bktree: plan - distanceExpr is Var: varno=%d, varattno=%d",
-			 v->varno, v->varattno);
-	}
-
-	/* Log outerVar */
-	elog(DEBUG1, "bktree: plan - outerVar: varno=%d, varattno=%d",
-		 path->outerVar->varno, path->outerVar->varattno);
-
 	/* Get the outer plan */
 	outerPlan = linitial(custom_plans);
-	elog(DEBUG1, "bktree: plan - outerPlan nodeTag=%d", nodeTag(outerPlan));
 
 	cscan = makeNode(CustomScan);
 	cscan->scan.plan.qual = NIL;  /* We don't have post-scan filters */
@@ -771,25 +708,24 @@ bktree_batch_join_plan(PlannerInfo *root,
 	cscan->flags = best_path->flags;
 
 	/*
-	 * Store custom private data as List of Consts.
-	 * We need: indexOid, indexedAttno, innerRelid, outerVar->varattno, distanceExpr, outerRelid
+	 * Store custom private data as List. See PRIVATE_* constants for layout.
 	 * The distanceExpr must be copied since it comes from the planner.
 	 */
-	cscan->custom_private = list_make1(
+	cscan->custom_private = list_make1(			/* PRIVATE_INDEX_OID */
 		makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
 				  ObjectIdGetDatum(path->indexOid), false, true));
-	cscan->custom_private = lappend(cscan->custom_private,
+	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_INDEXED_ATTNO */
 		makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
 				  Int16GetDatum(path->indexedAttno), false, true));
-	cscan->custom_private = lappend(cscan->custom_private,
+	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_INNER_RELID */
 		makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
 				  Int32GetDatum(path->innerRelid), false, true));
-	cscan->custom_private = lappend(cscan->custom_private,
+	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_OUTER_VAR_ATTNO */
 		makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
 				  Int16GetDatum(path->outerVar->varattno), false, true));
-	cscan->custom_private = lappend(cscan->custom_private,
+	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_DISTANCE_EXPR */
 		copyObject(path->distanceExpr));
-	cscan->custom_private = lappend(cscan->custom_private,
+	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_OUTER_RELID */
 		makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
 				  Int32GetDatum(path->outerVar->varno), false, true));
 
@@ -814,15 +750,6 @@ bktree_batch_join_plan(PlannerInfo *root,
 								   tle->resname,
 								   tle->resjunk);
 		scan_tlist = lappend(scan_tlist, scan_tle);
-
-		elog(DEBUG1, "bktree: plan - scan_tlist[%d] = %s",
-			 resno, IsA(tle->expr, Var) ? "Var" : "other");
-		if (IsA(tle->expr, Var))
-		{
-			Var *var = (Var *) tle->expr;
-			elog(DEBUG1, "bktree: plan - Var varno=%d, varattno=%d",
-				 var->varno, var->varattno);
-		}
 
 		/* Store varno info for this column in custom_private */
 		if (IsA(tle->expr, Var))
@@ -858,33 +785,6 @@ bktree_batch_join_plan(PlannerInfo *root,
 	cscan->custom_plans = list_make1(outerPlan);
 	cscan->methods = &bktree_batch_join_scan_methods;
 
-	/* Log what we produced */
-	elog(DEBUG1, "bktree: plan - plan.targetlist length=%d", list_length(cscan->scan.plan.targetlist));
-	elog(DEBUG1, "bktree: plan - scan_tlist length=%d", list_length(scan_tlist));
-	resno = 0;
-	foreach(lc, scan_tlist)
-	{
-		TargetEntry *tle = lfirst(lc);
-		elog(DEBUG1, "bktree: plan - scan_tlist[%d] nodeTag=%d", resno, nodeTag(tle->expr));
-		resno++;
-	}
-
-	elog(DEBUG1, "bktree: plan - custom_private length=%d", list_length(cscan->custom_private));
-	resno = 0;
-	foreach(lc, cscan->custom_private)
-	{
-		Node *item = lfirst(lc);
-		elog(DEBUG1, "bktree: plan - custom_private[%d] nodeTag=%d", resno, nodeTag(item));
-		if (IsA(item, Var))
-		{
-			Var *v = (Var *) item;
-			elog(DEBUG1, "bktree: plan - custom_private[%d] is Var! varno=%d, varattno=%d",
-				 resno, v->varno, v->varattno);
-		}
-		resno++;
-	}
-
-	elog(DEBUG1, "bktree: plan - complete, returning CustomScan");
 	return (Plan *) cscan;
 }
 
@@ -911,77 +811,46 @@ bktree_batch_join_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	BktreeBatchJoinState *state = (BktreeBatchJoinState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	List	   *priv = cscan->custom_private;
 	Plan	   *outerPlan;
-	Const	   *indexOidConst;
-	Const	   *indexedAttnoConst;
-	Const	   *innerRelidConst;
-	Const	   *outerVarAttnoConst;
-	Const	   *outerRelidConst;
 	Expr	   *distanceExpr;
 	List	   *tlist;
 	int			ncolumns;
 	int			i;
 	int			privIdx;
 
-	elog(DEBUG1, "bktree: begin - extracting private data, list length = %d",
-		 list_length(cscan->custom_private));
-
-	/* Extract fixed private data */
-	indexOidConst = linitial(cscan->custom_private);
-	indexedAttnoConst = lsecond(cscan->custom_private);
-	innerRelidConst = lthird(cscan->custom_private);
-	outerVarAttnoConst = lfourth(cscan->custom_private);
-	distanceExpr = (Expr *) list_nth(cscan->custom_private, 4);
-	outerRelidConst = (Const *) list_nth(cscan->custom_private, 5);
-
-	elog(DEBUG1, "bktree: begin - distanceExpr type = %d",
-		 distanceExpr ? nodeTag(distanceExpr) : -1);
-
-	state->indexOid = DatumGetObjectId(indexOidConst->constvalue);
-	state->indexedAttno = DatumGetInt16(indexedAttnoConst->constvalue);
-	state->outerVarAttno = DatumGetInt16(outerVarAttnoConst->constvalue);
-	state->innerRelid = DatumGetInt32(innerRelidConst->constvalue);
-	state->outerRelid = DatumGetInt32(outerRelidConst->constvalue);
-
-	elog(DEBUG1, "bktree: begin - indexOid=%u, indexedAttno=%d, outerVarAttno=%d, innerRelid=%d, outerRelid=%d",
-		 state->indexOid, state->indexedAttno, state->outerVarAttno,
-		 state->innerRelid, state->outerRelid);
+	/* Extract fixed private data using named indices */
+	state->indexOid = PRIVATE_GET_OID(priv, PRIVATE_INDEX_OID);
+	state->indexedAttno = PRIVATE_GET_INT16(priv, PRIVATE_INDEXED_ATTNO);
+	state->innerRelid = PRIVATE_GET_INT32(priv, PRIVATE_INNER_RELID);
+	state->outerVarAttno = PRIVATE_GET_INT16(priv, PRIVATE_OUTER_VAR_ATTNO);
+	state->outerRelid = PRIVATE_GET_INT32(priv, PRIVATE_OUTER_RELID);
+	distanceExpr = (Expr *) list_nth(priv, PRIVATE_DISTANCE_EXPR);
 
 	/*
 	 * Extract column mappings from custom_private.
-	 * After the first 6 entries, we have pairs of (varno, varattno) for each column.
+	 * After the fixed entries, we have pairs of (varno INT4, varattno INT2).
 	 */
 	tlist = cscan->scan.plan.targetlist;
 	ncolumns = list_length(tlist);
 	state->ncolMappings = ncolumns;
 	state->colMappings = palloc(sizeof(ColumnMapping) * ncolumns);
 
-	privIdx = 6;  /* Start after fixed entries */
+	privIdx = PRIVATE_COL_MAPPINGS;
 	for (i = 0; i < ncolumns; i++)
 	{
-		Const *varnoConst = (Const *) list_nth(cscan->custom_private, privIdx);
-		Const *varattnoConst = (Const *) list_nth(cscan->custom_private, privIdx + 1);
-
-		state->colMappings[i].varno = DatumGetInt32(varnoConst->constvalue);
-		state->colMappings[i].varattno = DatumGetInt16(varattnoConst->constvalue);
-
-		elog(DEBUG1, "bktree: begin - column %d: varno=%d, varattno=%d",
-			 i, state->colMappings[i].varno, state->colMappings[i].varattno);
-
+		state->colMappings[i].varno = PRIVATE_GET_INT32(priv, privIdx);
+		state->colMappings[i].varattno = PRIVATE_GET_INT16(priv, privIdx + 1);
 		privIdx += 2;
 	}
 
 	/* Compile distance expression */
-	elog(DEBUG1, "bktree: begin - about to ExecInitExpr");
 	state->distanceExprState = ExecInitExpr(distanceExpr, &node->ss.ps);
-	elog(DEBUG1, "bktree: begin - ExecInitExpr done");
 
 	/* Open index */
-	elog(DEBUG1, "bktree: begin - opening index");
 	state->index = index_open(state->indexOid, AccessShareLock);
 
 	/* Open inner relation (for heap fetches) */
-	elog(DEBUG1, "bktree: begin - opening inner relation");
 	{
 		RangeTblEntry *rte = exec_rt_fetch(state->innerRelid, estate);
 		state->innerRel = table_open(rte->relid, AccessShareLock);
@@ -989,18 +858,20 @@ bktree_batch_join_begin(CustomScanState *node, EState *estate, int eflags)
 		state->innerSlot = table_slot_create(state->innerRel,
 											 &estate->es_tupleTable);
 	}
-	elog(DEBUG1, "bktree: begin - inner relation opened");
 
 	/* Initialize outer plan */
-	elog(DEBUG1, "bktree: begin - initializing outer plan");
 	outerPlan = linitial(cscan->custom_plans);
 	state->outerPlan = ExecInitNode(outerPlan, estate, eflags);
-	state->outer_exhausted = false;
-	elog(DEBUG1, "bktree: begin - outer plan initialized");
 
-	/* Initialize batch state */
+	/* Create memory context for batch data (targets and results) */
+	state->batchContext = AllocSetContextCreate(estate->es_query_cxt,
+												"BktreeBatchJoin",
+												ALLOCSET_DEFAULT_SIZES);
+
+	/* Initialize batch state - allocate in batch context */
 	state->max_targets = MAX_BATCH_TARGETS;
-	state->targets = palloc(sizeof(int64) * state->max_targets);
+	state->targets = MemoryContextAlloc(state->batchContext,
+										sizeof(int64) * state->max_targets);
 	state->ntargets = 0;
 	state->distance = 0;
 
@@ -1008,17 +879,6 @@ bktree_batch_join_begin(CustomScanState *node, EState *estate, int eflags)
 	state->nresults = 0;
 	state->curr_result = 0;
 	state->search_done = false;
-
-	/* Log projection state */
-	elog(DEBUG1, "bktree: begin - ps_ProjInfo=%p", node->ss.ps.ps_ProjInfo);
-	if (node->ss.ps.ps_ProjInfo)
-	{
-		ProjectionInfo *proj = node->ss.ps.ps_ProjInfo;
-		elog(DEBUG1, "bktree: begin - projection pi_exprContext=%p",
-			 proj->pi_exprContext);
-	}
-
-	elog(DEBUG1, "bktree: begin - complete");
 }
 
 /*
@@ -1041,12 +901,19 @@ collect_targets(BktreeBatchJoinState *state)
 		if (isnull)
 			continue;
 
+		/* Grow targets array if needed */
 		if (state->ntargets >= state->max_targets)
 		{
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("too many targets for batch join, maximum is %d",
-							MAX_BATCH_TARGETS)));
+			int		new_max = state->max_targets * 2;
+			int64  *new_targets;
+
+			new_targets = MemoryContextAlloc(state->batchContext,
+											 sizeof(int64) * new_max);
+			memcpy(new_targets, state->targets,
+				   sizeof(int64) * state->ntargets);
+			/* Old array will be freed when context is reset */
+			state->targets = new_targets;
+			state->max_targets = new_max;
 		}
 
 		state->targets[state->ntargets++] = DatumGetInt64(val);
@@ -1064,7 +931,6 @@ collect_targets(BktreeBatchJoinState *state)
 		}
 	}
 
-	state->outer_exhausted = true;
 }
 
 /*
@@ -1074,6 +940,7 @@ static void
 execute_batch_search(BktreeBatchJoinState *state)
 {
 	BatchSearchState bss;
+	MemoryContext oldcxt;
 
 	if (state->ntargets == 0)
 	{
@@ -1081,6 +948,9 @@ execute_batch_search(BktreeBatchJoinState *state)
 		state->nresults = 0;
 		return;
 	}
+
+	/* Allocate results in batch context for easy cleanup on rescan */
+	oldcxt = MemoryContextSwitchTo(state->batchContext);
 
 	/* Initialize batch search state */
 	memset(&bss, 0, sizeof(bss));
@@ -1091,6 +961,8 @@ execute_batch_search(BktreeBatchJoinState *state)
 	bss.max_results = 1024;
 	bss.results = palloc(sizeof(BatchResult) * bss.max_results);
 	bss.nresults = 0;
+
+	MemoryContextSwitchTo(oldcxt);
 
 	/* Execute the batch search */
 	bktree_batch_execute(&bss);
@@ -1110,24 +982,16 @@ bktree_batch_join_next(CustomScanState *node)
 	TupleTableSlot *scanSlot = node->ss.ps.ps_ResultTupleSlot;
 	Snapshot	snapshot;
 
-	elog(DEBUG1, "bktree: next called, search_done=%d", state->search_done);
-
 	/* First call: collect targets and execute batch search */
 	if (!state->search_done)
 	{
-		elog(DEBUG1, "bktree: next - collecting targets");
 		collect_targets(state);
-		elog(DEBUG1, "bktree: next - collected %d targets", state->ntargets);
 		execute_batch_search(state);
-		elog(DEBUG1, "bktree: next - batch search done, %d results", state->nresults);
 		state->search_done = true;
 		state->curr_result = 0;
 	}
 
 	snapshot = GetActiveSnapshot();
-
-	elog(DEBUG1, "bktree: next - at result %d of %d",
-		 state->curr_result, state->nresults);
 
 	/* Return next result */
 	while (state->curr_result < state->nresults)
@@ -1180,24 +1044,9 @@ bktree_batch_join_next(CustomScanState *node)
 		}
 
 		ExecStoreVirtualTuple(scanSlot);
-
-		elog(DEBUG1, "bktree: next - returning tuple for result %d",
-			 state->curr_result - 1);
 		return scanSlot;
 	}
-
-	elog(DEBUG1, "bktree: next - no more results");
 	return NULL;
-}
-
-/*
- * Recheck method for ExecScan - we don't need rechecks.
- */
-static bool
-bktree_batch_join_recheck(CustomScanState *node, TupleTableSlot *slot)
-{
-	/* No recheck needed - we already verified visibility */
-	return true;
 }
 
 /*
@@ -1206,21 +1055,7 @@ bktree_batch_join_recheck(CustomScanState *node, TupleTableSlot *slot)
 static TupleTableSlot *
 bktree_batch_join_exec(CustomScanState *node)
 {
-	TupleTableSlot *slot;
-
-	elog(DEBUG1, "bktree: exec called");
-
-	slot = bktree_batch_join_next(node);
-
-	if (slot == NULL)
-	{
-		/* Return empty result slot instead of NULL */
-		elog(DEBUG1, "bktree: exec - returning cleared result slot");
-		return ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	}
-
-	elog(DEBUG1, "bktree: exec returning tuple");
-	return slot;
+	return bktree_batch_join_next(node);
 }
 
 /*
@@ -1241,11 +1076,11 @@ bktree_batch_join_end(CustomScanState *node)
 	if (state->innerRel)
 		table_close(state->innerRel, AccessShareLock);
 
-	/* Free allocated memory */
-	if (state->targets)
-		pfree(state->targets);
-	if (state->results)
-		pfree(state->results);
+	/* Delete batch context (frees targets, results) */
+	if (state->batchContext)
+		MemoryContextDelete(state->batchContext);
+
+	/* Free column mappings (allocated in executor context) */
 	if (state->colMappings)
 		pfree(state->colMappings);
 }
@@ -1258,19 +1093,19 @@ bktree_batch_join_rescan(CustomScanState *node)
 {
 	BktreeBatchJoinState *state = (BktreeBatchJoinState *) node;
 
+	/* Reset batch context - frees both targets and results efficiently */
+	MemoryContextReset(state->batchContext);
+
+	/* Reallocate targets array in fresh context */
+	state->targets = MemoryContextAlloc(state->batchContext,
+										sizeof(int64) * state->max_targets);
+
 	/* Reset state */
 	state->ntargets = 0;
+	state->results = NULL;
 	state->nresults = 0;
 	state->curr_result = 0;
 	state->search_done = false;
-	state->outer_exhausted = false;
-
-	/* Free previous results */
-	if (state->results)
-	{
-		pfree(state->results);
-		state->results = NULL;
-	}
 
 	/* Rescan outer */
 	if (state->outerPlan)
