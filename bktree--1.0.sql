@@ -15,13 +15,23 @@ CREATE OR REPLACE FUNCTION bktree_eq_match(int8, int8) RETURNS boolean AS
 'MODULE_PATHNAME','bktree_eq_match'
 LANGUAGE C IMMUTABLE STRICT;
 
+-- Selectivity estimation functions for bktree operators
+CREATE OR REPLACE FUNCTION bktree_restrict_sel(internal, oid, internal, integer)
+RETURNS float8 AS
+'MODULE_PATHNAME','bktree_restrict_sel'
+LANGUAGE C IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION bktree_join_sel(internal, oid, internal, smallint, internal)
+RETURNS float8 AS
+'MODULE_PATHNAME','bktree_join_sel'
+LANGUAGE C IMMUTABLE STRICT;
 
 CREATE OPERATOR <@ (
 	LEFTARG = int8,
 	RIGHTARG = bktree_area,
 	PROCEDURE = bktree_area_match,
-	RESTRICT = contsel,
-	JOIN = contjoinsel);
+	RESTRICT = bktree_restrict_sel,
+	JOIN = bktree_join_sel);
 
 CREATE OPERATOR = (
 	LEFTARG = int8,
@@ -102,6 +112,6 @@ CREATE OR REPLACE FUNCTION bktree_search(
 	column_name name,
 	targets int8[],
 	distance int8
-) RETURNS TABLE(target_hash int8, match_hash int8, match_tid tid) AS
+) RETURNS TABLE(target int8, match int8, tid tid) AS
 'MODULE_PATHNAME','bktree_search'
 LANGUAGE C STABLE STRICT;
