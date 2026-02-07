@@ -521,6 +521,7 @@ is_bktree_batch_join(PlannerInfo *root,
 static void
 cost_bktree_batch_join(PlannerInfo *root,
 					   BktreeBatchJoinPath *path,
+					   RelOptInfo *joinrel,
 					   RelOptInfo *outerrel,
 					   RelOptInfo *innerrel)
 {
@@ -529,22 +530,6 @@ cost_bktree_batch_join(PlannerInfo *root,
 	double		outer_rows = outerrel->rows;
 	double		index_pages;
 	double		result_rows;
-	double		matches_per_target;
-	int			distance = 4;	/* default assumption */
-
-	/* Try to extract constant distance value for better estimation */
-	if (path->distanceExpr && IsA(path->distanceExpr, Const))
-	{
-		Const *c = (Const *) path->distanceExpr;
-		if (!c->constisnull)
-		{
-			/* Distance is typically int4 or int8 */
-			if (c->consttype == INT4OID)
-				distance = DatumGetInt32(c->constvalue);
-			else if (c->consttype == INT8OID)
-				distance = (int) DatumGetInt64(c->constvalue);
-		}
-	}
 
 	/* Must materialize outer first */
 	startup_cost += path->outerpath->total_cost;
@@ -557,47 +542,33 @@ cost_bktree_batch_join(PlannerInfo *root,
 	 * check all N targets, but this is just N cheap hamming distance
 	 * calculations - much cheaper than N separate I/O operations.
 	 *
-	 * Estimate: single traversal touches ~log(tuples) * branching_factor nodes.
-	 * For SP-GiST with 65 children per node, tree is very shallow.
+	 * For SP-GiST BK-tree, the tree is shallow (log base ~65 of tuples).
+	 * A single traversal visits far fewer pages than N separate scans.
 	 */
-	index_pages = Max(10.0, log(innerrel->tuples + 1) * 3);
+	index_pages = Max(5.0, log(innerrel->tuples + 1) * 2);
 
-	/* Single traversal I/O cost */
-	run_cost += index_pages * random_page_cost;
+	/*
+	 * Index I/O cost: single traversal for all targets.
+	 * This is the main advantage - N targets share the same traversal cost.
+	 * Use seq_page_cost since traversal is mostly sequential within the index.
+	 */
+	run_cost += index_pages * seq_page_cost;
 
 	/* CPU cost: at each node, check all targets (cheap hamming distance) */
 	run_cost += index_pages * outer_rows * cpu_operator_cost * 0.1;
 
 	/*
-	 * Estimate result rows based on distance threshold.
-	 *
-	 * For perceptual hashes with hamming distance, matches are rare:
-	 * - Distance 0: exact matches only, typically 0-1 per target
-	 * - Distance 1-2: very few matches (near-duplicates)
-	 * - Distance 3-4: few matches
-	 * - Distance 5-8: moderate matches
-	 * - Distance 9+: many matches
-	 *
-	 * We estimate expected matches per target conservatively.
+	 * Use the planner's row estimate for this join - ensures consistency
+	 * with other paths so the planner can make fair cost comparisons.
 	 */
-	if (distance <= 0)
-		matches_per_target = 0.5;
-	else if (distance <= 2)
-		matches_per_target = 1.0;
-	else if (distance <= 4)
-		matches_per_target = 3.0;
-	else if (distance <= 6)
-		matches_per_target = 10.0;
-	else if (distance <= 8)
-		matches_per_target = 30.0;
-	else
-		matches_per_target = 100.0;
+	result_rows = joinrel->rows;
 
-	result_rows = outer_rows * matches_per_target;
-	result_rows = Max(1.0, result_rows);
-
-	/* Heap tuple fetches - these are random I/O */
-	run_cost += result_rows * random_page_cost;
+	/*
+	 * Heap tuple fetches. Results are often clustered (similar hashes near
+	 * each other in heap), so use a reduced I/O cost. Also, with batch
+	 * fetching we can amortize costs better than per-row nested loop.
+	 */
+	run_cost += result_rows * seq_page_cost * 0.5;
 	run_cost += result_rows * cpu_tuple_cost;
 
 	path->cpath.path.startup_cost = startup_cost;
@@ -663,8 +634,8 @@ create_bktree_batch_join_path(PlannerInfo *root,
 	pathnode->outerVar = info->outerVar;
 	pathnode->innerRelid = info->innerRelid;
 
-	/* Compute costs */
-	cost_bktree_batch_join(root, pathnode, outerrel, innerrel);
+	/* Compute costs - use joinrel->rows for consistent row estimate */
+	cost_bktree_batch_join(root, pathnode, joinrel, outerrel, innerrel);
 
 	elog(DEBUG1, "bktree: created path with cost %.2f..%.2f rows=%.0f",
 		 pathnode->cpath.path.startup_cost,
