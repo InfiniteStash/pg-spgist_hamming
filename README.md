@@ -3,7 +3,7 @@ pg-spgist_hamming
 
 Forked from https://github.com/fake-name/pg-spgist_hamming, all credit for orignal implementation goes to [fake-name](https://github.com/fake-name)
 
-This fork has been slightly optimized for better tree balancing. Additionally, it includes a new `bktree_search` batch function, which can query for up to 64 hashes at the same time. From testing this is about 6-7x faster than querying batches of hashes sequentially.
+This fork has been slightly optimized for better tree balancing. Additionally, it includes a batch search plan, which can query for up to 64 hashes at the same time. From testing this is about 4-7x faster than querying batches of hashes in a nested loop.
 
 Tested on PostgreSQL 18
 
@@ -23,7 +23,6 @@ sudo make installcheck   # to run tests that check everything installed correctl
 ```
 
 
-
 Once you have it installed:
 
 
@@ -40,7 +39,7 @@ CREATE INDEX bk_index_name ON table_name USING spgist (phash_column bktree_ops);
 SELECT <columns here> FROM table_name WHERE phash_column <@ (target_phash_int64, search_distance_int);
 
 # Query a table for a batch of values within a specified edit distance
-SELECT target, match, tid FROM bktree_search(<table_name>, <column>, <target_phash_int64[]>, search_distance_int);
+SELECT <columns> FROM UNNEST(<target_phash_int64[]>) phashes JOIN table_name ON <column> <@ (<target_phash_int64>, search_distance_int)
 ```
 
 You'll need to replace things like `bk_index_name`, `table_name`, `target_phash_int64`, `search_distance_int`, 
