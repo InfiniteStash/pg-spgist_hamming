@@ -14,6 +14,7 @@
 #include "access/htup_details.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_operator.h"
 #include "catalog/indexing.h"
 #include "executor/executor.h"
 #include "utils/array.h"
@@ -27,11 +28,10 @@
 
 #include <string.h>
 
+#include "bktree.h"
+
 PG_FUNCTION_INFO_V1(bktree_batch_search);
 PG_FUNCTION_INFO_V1(bktree_search);
-
-/* Maximum number of targets in a single batch (limited by bitmask) */
-#define MAX_BATCH_TARGETS 64
 
 /* Work item for traversal stack */
 typedef struct BatchStackItem
@@ -41,28 +41,9 @@ typedef struct BatchStackItem
 	uint64		activeTargets;	/* bitmask of targets still searching this path */
 } BatchStackItem;
 
-/* Result item */
-typedef struct BatchResult
-{
-	int64		target_hash;
-	int64		match_hash;
-	ItemPointerData heap_tid;
-} BatchResult;
-
-/* Batch search state */
-typedef struct BatchSearchState
-{
-	int64	   *targets;		/* array of target hashes */
-	int			ntargets;		/* number of targets */
-	int64		distance;		/* search distance */
-
-	BatchResult *results;		/* accumulated results */
-	int			nresults;		/* number of results */
-	int			max_results;	/* allocated size */
-
-	Relation	index;			/* the SP-GiST index */
-	SpGistState spgstate;		/* SP-GiST state */
-} BatchSearchState;
+/* Cached OIDs for extension types/operators */
+static Oid	CachedBktreeAreaTypeOid = InvalidOid;
+static Oid	CachedBktreeContainmentOpOid = InvalidOid;
 
 /*
  * Compute hamming distance between two int64 values
@@ -71,6 +52,42 @@ static inline int
 hamming_distance(int64 a, int64 b)
 {
 	return __builtin_popcountll((uint64)(a ^ b));
+}
+
+/*
+ * Get OID of the bktree_area composite type.
+ * Cached after first lookup.
+ */
+Oid
+bktree_area_type_oid(void)
+{
+	if (!OidIsValid(CachedBktreeAreaTypeOid))
+	{
+		CachedBktreeAreaTypeOid = TypenameGetTypid("bktree_area");
+		if (!OidIsValid(CachedBktreeAreaTypeOid))
+			elog(ERROR, "type bktree_area not found");
+	}
+	return CachedBktreeAreaTypeOid;
+}
+
+/*
+ * Get OID of the <@ (containment) operator for int8/bktree_area.
+ * Cached after first lookup.
+ */
+Oid
+bktree_containment_op_oid(void)
+{
+	if (!OidIsValid(CachedBktreeContainmentOpOid))
+	{
+		/* Look up operator <@(int8, bktree_area) */
+		CachedBktreeContainmentOpOid = OpernameGetOprid(
+			list_make1(makeString("<@")),
+			INT8OID,
+			bktree_area_type_oid());
+		if (!OidIsValid(CachedBktreeContainmentOpOid))
+			elog(ERROR, "operator <@(int8, bktree_area) not found");
+	}
+	return CachedBktreeContainmentOpOid;
 }
 
 /*
@@ -524,16 +541,25 @@ find_bktree_index(Oid tableOid, const char *columnName)
 }
 
 /*
- * Core batch search logic - shared by both entry points
+ * Core batch search logic - exported for use by CustomScan
+ *
+ * Caller must have initialized:
+ *   - state->targets, state->ntargets, state->distance
+ *   - state->index (opened with at least AccessShareLock)
+ *   - state->results, state->max_results (pre-allocated)
+ *   - state->nresults = 0
+ *
+ * On return, state->results contains all matches and state->nresults
+ * indicates how many were found.
  */
-static void
-do_batch_search(BatchSearchState *state, Relation index)
+void
+bktree_batch_execute(BatchSearchState *state)
 {
 	BatchStackItem *stack;
 	int			stackDepth;
 	int			maxStack;
 
-	initSpGistState(&state->spgstate, index);
+	initSpGistState(&state->spgstate, state->index);
 
 	/* Allocate traversal stack */
 	maxStack = 65 * 100;
@@ -557,7 +583,7 @@ do_batch_search(BatchSearchState *state, Relation index)
 		if (item.activeTargets == 0)
 			continue;
 
-		traverse_inner(state, index, item.blkno, item.offset,
+		traverse_inner(state, state->index, item.blkno, item.offset,
 					   item.activeTargets, stack, &stackDepth, maxStack);
 	}
 
@@ -648,7 +674,7 @@ bktree_search(PG_FUNCTION_ARGS)
 		state->index = index;
 
 		/* Do the batch search */
-		do_batch_search(state, index);
+		bktree_batch_execute(state);
 
 		/* Build result tuple descriptor */
 		tupdesc = CreateTemplateTupleDesc(3);

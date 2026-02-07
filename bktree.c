@@ -8,10 +8,23 @@
 #include "utils/geo_decls.h"
 #include "utils/array.h"
 #include "utils/rel.h"
+#include "utils/lsyscache.h"
+#include "utils/selfuncs.h"
+#include "nodes/supportnodes.h"
 
 #include "bk_tree_debug_func.h"
+#include "bktree.h"
 
 PG_MODULE_MAGIC;
+
+/*
+ * Module initialization - register planner hooks for CustomScan optimization.
+ */
+void
+_PG_init(void)
+{
+	bktree_register_hooks();
+}
 
 PG_FUNCTION_INFO_V1(bktree_config);
 PG_FUNCTION_INFO_V1(bktree_eq_match);
@@ -21,6 +34,8 @@ PG_FUNCTION_INFO_V1(bktree_inner_consistent);
 PG_FUNCTION_INFO_V1(bktree_leaf_consistent);
 PG_FUNCTION_INFO_V1(bktree_area_match);
 PG_FUNCTION_INFO_V1(bktree_get_distance);
+PG_FUNCTION_INFO_V1(bktree_restrict_sel);
+PG_FUNCTION_INFO_V1(bktree_join_sel);
 
 Datum bktree_config(PG_FUNCTION_ARGS);
 Datum bktree_choose(PG_FUNCTION_ARGS);
@@ -28,8 +43,9 @@ Datum bktree_picksplit(PG_FUNCTION_ARGS);
 Datum bktree_inner_consistent(PG_FUNCTION_ARGS);
 Datum bktree_leaf_consistent(PG_FUNCTION_ARGS);
 Datum bktree_area_match(PG_FUNCTION_ARGS);
-
 Datum bktree_get_distance(PG_FUNCTION_ARGS);
+Datum bktree_restrict_sel(PG_FUNCTION_ARGS);
+Datum bktree_join_sel(PG_FUNCTION_ARGS);
 
 
 #define int_min(a, b) (((a) < (b)) ? (a) : (b))
@@ -422,4 +438,164 @@ bktree_get_distance(PG_FUNCTION_ARGS)
 	int64_t value_2 = PG_GETARG_INT64(1);
 
 	PG_RETURN_INT64(f_hamming(value_1, value_2));
+}
+
+/*
+ * Estimate selectivity for hamming distance search based on distance threshold.
+ *
+ * For 64-bit hamming distance, the number of hashes within distance d is:
+ *   sum(C(64,i) for i in 0..d)
+ *
+ * This grows roughly as 4^d for small d. We use an empirical model:
+ * - Distance 0: ~1e-9 (exact match in huge hash space)
+ * - Each additional distance roughly quadruples matches
+ *
+ * Returns selectivity clamped to [1e-10, 0.5]
+ */
+static double
+bktree_estimate_selectivity(int distance)
+{
+	double sel;
+
+	if (distance < 0)
+		distance = 0;
+
+	/*
+	 * Empirical model for perceptual hash matching:
+	 * Base selectivity ~1e-9, doubling every 2 bits of distance.
+	 */
+	sel = 1e-9 * pow(4.0, (double) distance);
+
+	/* Clamp to reasonable range */
+	if (sel < 1e-10)
+		sel = 1e-10;
+	if (sel > 0.5)
+		sel = 0.5;
+
+	return sel;
+}
+
+/*
+ * Try to extract distance value from a bktree_area ROW expression.
+ * Returns -1 if distance cannot be determined.
+ */
+static int
+extract_distance_from_args(List *args)
+{
+	Node	   *rightarg;
+	HeapTupleHeader th;
+	Datum		distance_datum;
+	bool		isnull;
+
+	if (list_length(args) < 2)
+		return -1;
+
+	rightarg = (Node *) lsecond(args);
+
+	/* Handle ROW(hash, distance) - at planning time this is a RowExpr or Const */
+	if (IsA(rightarg, Const))
+	{
+		Const *c = (Const *) rightarg;
+
+		if (c->constisnull)
+			return -1;
+
+		/* bktree_area is a composite type stored as HeapTupleHeader */
+		th = DatumGetHeapTupleHeader(c->constvalue);
+
+		/* Field 2 is the distance (1-indexed in GetAttributeByNum) */
+		distance_datum = GetAttributeByNum(th, 2, &isnull);
+		if (isnull)
+			return -1;
+
+		return (int) DatumGetInt64(distance_datum);
+	}
+	else if (IsA(rightarg, RowExpr))
+	{
+		RowExpr *rowexpr = (RowExpr *) rightarg;
+		Node *distance_node;
+
+		if (list_length(rowexpr->args) < 2)
+			return -1;
+
+		distance_node = (Node *) lsecond(rowexpr->args);
+
+		if (IsA(distance_node, Const))
+		{
+			Const *c = (Const *) distance_node;
+			if (c->constisnull)
+				return -1;
+
+			if (c->consttype == INT4OID)
+				return DatumGetInt32(c->constvalue);
+			else if (c->consttype == INT8OID)
+				return (int) DatumGetInt64(c->constvalue);
+		}
+	}
+
+	return -1;
+}
+
+/*
+ * Restriction selectivity for bktree <@ operator.
+ */
+Datum
+bktree_restrict_sel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	Oid			operator = PG_GETARG_OID(1);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+	int			varRelid = PG_GETARG_INT32(3);
+	double		selec;
+	int			distance;
+
+	(void) root;		/* unused */
+	(void) operator;	/* unused */
+	(void) varRelid;	/* unused */
+
+	/* Try to extract distance from the query */
+	distance = extract_distance_from_args(args);
+
+	if (distance < 0)
+	{
+		/* Couldn't determine distance, use conservative default (distance ~4) */
+		distance = 4;
+	}
+
+	selec = bktree_estimate_selectivity(distance);
+
+	PG_RETURN_FLOAT8((float8) selec);
+}
+
+/*
+ * Join selectivity for bktree <@ operator.
+ */
+Datum
+bktree_join_sel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	Oid			operator = PG_GETARG_OID(1);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+	JoinType	jointype = (JoinType) PG_GETARG_INT16(3);
+	SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) PG_GETARG_POINTER(4);
+	double		selec;
+	int			distance;
+
+	(void) root;		/* unused */
+	(void) operator;	/* unused */
+	(void) jointype;	/* unused */
+	(void) sjinfo;		/* unused */
+
+	/* Try to extract distance from the query */
+	distance = extract_distance_from_args(args);
+
+	if (distance < 0)
+	{
+		/* Couldn't determine distance, use conservative default */
+		distance = 4;
+	}
+
+	selec = bktree_estimate_selectivity(distance);
+
+	PG_RETURN_FLOAT8((float8) selec);
 }
