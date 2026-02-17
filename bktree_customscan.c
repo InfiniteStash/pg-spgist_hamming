@@ -70,11 +70,12 @@ static set_join_pathlist_hook_type prev_join_hook = NULL;
 typedef struct BktreeBatchJoinInfo
 {
 	Oid			indexOid;		/* OID of the bktree SP-GiST index */
+	Oid			innerTableOid;	/* OID of the indexed table (stable across plan changes) */
 	AttrNumber	indexedAttno;	/* attribute number of indexed column */
 	Expr	   *distanceExpr;	/* expression for distance value */
 	Var		   *outerVar;		/* the UNNEST variable */
 	RestrictInfo *joinClause;	/* the <@ join condition */
-	Index		innerRelid;		/* inner relation's relid (for var matching) */
+	Index		innerRelid;		/* inner relation's relid (for var matching at plan time) */
 } BktreeBatchJoinInfo;
 
 /*
@@ -85,11 +86,13 @@ typedef struct BktreeBatchJoinPath
 	CustomPath	cpath;
 
 	Path	   *outerpath;		/* Path for UNNEST result */
+	Path	   *innerpath;		/* Path for inner relation (not executed, for planner) */
 	Oid			indexOid;		/* Bktree index on inner table */
+	Oid			innerTableOid;	/* OID of the indexed table */
 	AttrNumber	indexedAttno;	/* Indexed column */
 	Expr	   *distanceExpr;	/* Distance value expression */
 	Var		   *outerVar;		/* Variable from outer (for projection) */
-	Index		innerRelid;		/* Inner relation's relid */
+	Index		innerRelid;		/* Inner relation's relid (for plan-time var matching) */
 } BktreeBatchJoinPath;
 
 /*
@@ -97,7 +100,7 @@ typedef struct BktreeBatchJoinPath
  */
 typedef struct ColumnMapping
 {
-	Index		varno;			/* Source relation (innerRelid or outerRelid, or -1) */
+	int32		isOuter;		/* 0 = from inner, 1 = from outer, -1 = special */
 	AttrNumber	varattno;		/* Attribute number in source */
 } ColumnMapping;
 
@@ -108,19 +111,22 @@ typedef struct ColumnMapping
  * List structure:
  *   [0] = indexOid (Const OID)
  *   [1] = indexedAttno (Const INT2)
- *   [2] = innerRelid (Const INT4)
+ *   [2] = innerTableOid (Const OID) - stable table OID for table_open
  *   [3] = outerVarAttno (Const INT2)
  *   [4] = distanceExpr (Expr node)
- *   [5] = outerRelid (Const INT4)
- *   [6..] = column mappings as pairs of (varno INT4, varattno INT2)
+ *   [5] = innerRelid (Const INT4) - RT index for plan-time var matching only
+ *   [6] = outerRelid (Const INT4) - RT index for plan-time var matching only
+ *   [7..] = column mappings as pairs of (isOuter INT4, varattno INT2)
+ *           isOuter: 0 = from inner relation, 1 = from outer (target hash)
  */
 #define PRIVATE_INDEX_OID		0
 #define PRIVATE_INDEXED_ATTNO	1
-#define PRIVATE_INNER_RELID		2
+#define PRIVATE_INNER_TABLE_OID	2
 #define PRIVATE_OUTER_VAR_ATTNO	3
 #define PRIVATE_DISTANCE_EXPR	4
-#define PRIVATE_OUTER_RELID		5
-#define PRIVATE_COL_MAPPINGS	6	/* Start of column mapping pairs */
+#define PRIVATE_INNER_RELID		5
+#define PRIVATE_OUTER_RELID		6
+#define PRIVATE_COL_MAPPINGS	7	/* Start of column mapping pairs */
 
 /* Helper to extract Const value from custom_private */
 static inline Datum
@@ -142,8 +148,9 @@ typedef struct BktreeBatchJoinState
 {
 	CustomScanState css;
 
-	/* Outer scan state */
+	/* Child plan states */
 	PlanState  *outerPlan;
+	PlanState  *innerPlan;		/* Kept for planner legality, not executed */
 
 	/* Batch search state */
 	Relation	index;
@@ -164,14 +171,11 @@ typedef struct BktreeBatchJoinState
 	Relation	innerRel;
 	TupleTableSlot *innerSlot;	/* Slot for fetched heap tuples */
 	Oid			indexOid;
+	Oid			innerTableOid;	/* Stable table OID for opening relation */
 	AttrNumber	indexedAttno;
 
 	/* Outer var attno for extracting target value */
 	AttrNumber	outerVarAttno;
-
-	/* Relation indices */
-	Index		innerRelid;		/* Inner relation's RT index */
-	Index		outerRelid;		/* Outer relation's RT index */
 
 	/* Column mappings - how to build output tuple */
 	ColumnMapping *colMappings;	/* Array of column mappings */
@@ -271,9 +275,11 @@ is_unnest_function_scan(PlannerInfo *root, RelOptInfo *rel)
 /*
  * Find a bktree SP-GiST index on the given relation.
  * Returns InvalidOid if not found.
+ * Also returns the base table OID via tableOid parameter.
  */
 static Oid
-find_bktree_index_for_rel(RelOptInfo *rel, AttrNumber *indexedAttno)
+find_bktree_index_for_rel(PlannerInfo *root, RelOptInfo *rel,
+						  AttrNumber *indexedAttno, Oid *tableOid)
 {
 	ListCell *lc;
 
@@ -333,12 +339,17 @@ find_bktree_index_for_rel(RelOptInfo *rel, AttrNumber *indexedAttno)
 				continue;
 		}
 
-		/* Found a bktree index */
+		/* Found a bktree index - get the base table OID from RTE */
 		*indexedAttno = index->indexkeys[0];
+		{
+			RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+			*tableOid = rte->relid;
+		}
 		return index->indexoid;
 	}
 
 	*indexedAttno = InvalidAttrNumber;
+	*tableOid = InvalidOid;
 	return InvalidOid;
 }
 
@@ -481,6 +492,7 @@ is_bktree_batch_join(PlannerInfo *root,
 {
 	ListCell   *lc;
 	Oid			indexOid;
+	Oid			tableOid;
 	AttrNumber	indexedAttno;
 
 	/* Check outer is UNNEST function scan */
@@ -490,13 +502,14 @@ is_bktree_batch_join(PlannerInfo *root,
 	}
 
 	/* Check inner has bktree index */
-	indexOid = find_bktree_index_for_rel(innerrel, &indexedAttno);
+	indexOid = find_bktree_index_for_rel(root, innerrel, &indexedAttno, &tableOid);
 	if (!OidIsValid(indexOid))
 	{
 		return false;
 	}
 
 	info->indexOid = indexOid;
+	info->innerTableOid = tableOid;
 	info->indexedAttno = indexedAttno;
 	info->innerRelid = innerrel->relid;
 
@@ -589,19 +602,21 @@ create_bktree_batch_join_path(PlannerInfo *root,
 {
 	BktreeBatchJoinPath *pathnode;
 	Path	   *outerpath;
+	Path	   *innerpath;
 
 	/* Get cheapest outer path */
 	outerpath = outerrel->cheapest_total_path;
 	if (outerpath == NULL)
-	{
 		return;
-	}
+
+	/* Get cheapest inner path (kept for planner legality, not executed) */
+	innerpath = innerrel->cheapest_total_path;
+	if (innerpath == NULL)
+		return;
 
 	/* Limit to MAX_BATCH_TARGETS rows */
 	if (outerrel->rows > MAX_BATCH_TARGETS)
-	{
 		return;
-	}
 
 	/* Create the custom path */
 	pathnode = palloc0(sizeof(BktreeBatchJoinPath));
@@ -617,12 +632,15 @@ create_bktree_batch_join_path(PlannerInfo *root,
 	pathnode->cpath.path.pathkeys = NIL;  /* Unordered output */
 
 	pathnode->cpath.flags = 0;
-	pathnode->cpath.custom_paths = list_make1(outerpath);
+	/* Include both paths - inner is for planner legality, not executed */
+	pathnode->cpath.custom_paths = list_make2(outerpath, innerpath);
 	pathnode->cpath.custom_private = NIL;
 	pathnode->cpath.methods = &bktree_batch_join_path_methods;
 
 	pathnode->outerpath = outerpath;
+	pathnode->innerpath = innerpath;
 	pathnode->indexOid = info->indexOid;
+	pathnode->innerTableOid = info->innerTableOid;
 	pathnode->indexedAttno = info->indexedAttno;
 	pathnode->distanceExpr = info->distanceExpr;
 	pathnode->outerVar = info->outerVar;
@@ -694,13 +712,11 @@ bktree_batch_join_plan(PlannerInfo *root,
 {
 	BktreeBatchJoinPath *path = (BktreeBatchJoinPath *) best_path;
 	CustomScan *cscan;
-	Plan	   *outerPlan;
 	List	   *scan_tlist = NIL;
 	ListCell   *lc;
 	int			resno;
-
-	/* Get the outer plan */
-	outerPlan = linitial(custom_plans);
+	Index		outerRelid = path->outerVar->varno;
+	Index		innerRelid = path->innerRelid;
 
 	cscan = makeNode(CustomScan);
 	cscan->scan.plan.qual = NIL;  /* We don't have post-scan filters */
@@ -710,6 +726,9 @@ bktree_batch_join_plan(PlannerInfo *root,
 	/*
 	 * Store custom private data as List. See PRIVATE_* constants for layout.
 	 * The distanceExpr must be copied since it comes from the planner.
+	 *
+	 * Key change: store innerTableOid (stable OID) instead of relying on
+	 * RT indices which become invalid in UNION/subquery contexts.
 	 */
 	cscan->custom_private = list_make1(			/* PRIVATE_INDEX_OID */
 		makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
@@ -717,17 +736,20 @@ bktree_batch_join_plan(PlannerInfo *root,
 	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_INDEXED_ATTNO */
 		makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
 				  Int16GetDatum(path->indexedAttno), false, true));
-	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_INNER_RELID */
-		makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
-				  Int32GetDatum(path->innerRelid), false, true));
+	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_INNER_TABLE_OID */
+		makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+				  ObjectIdGetDatum(path->innerTableOid), false, true));
 	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_OUTER_VAR_ATTNO */
 		makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
 				  Int16GetDatum(path->outerVar->varattno), false, true));
 	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_DISTANCE_EXPR */
 		copyObject(path->distanceExpr));
+	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_INNER_RELID */
+		makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+				  Int32GetDatum(innerRelid), false, true));
 	cscan->custom_private = lappend(cscan->custom_private,	/* PRIVATE_OUTER_RELID */
 		makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
-				  Int32GetDatum(path->outerVar->varno), false, true));
+				  Int32GetDatum(outerRelid), false, true));
 
 	/*
 	 * Build custom_scan_tlist - this describes what our scan produces.
@@ -735,8 +757,8 @@ bktree_batch_join_plan(PlannerInfo *root,
 	 * varnos. setrefs will use this to build an indexed_tlist and convert
 	 * the plan's targetlist Vars to INDEX_VAR references.
 	 *
-	 * We store the original varnos in custom_private so exec knows
-	 * which slot to get each column from.
+	 * For column mappings, we use isOuter (0=inner, 1=outer) which is stable
+	 * regardless of plan embedding, unlike RT indices.
 	 */
 	resno = 1;
 	foreach(lc, tlist)
@@ -751,20 +773,22 @@ bktree_batch_join_plan(PlannerInfo *root,
 								   tle->resjunk);
 		scan_tlist = lappend(scan_tlist, scan_tle);
 
-		/* Store varno info for this column in custom_private */
+		/* Store isOuter flag and varattno for this column */
 		if (IsA(tle->expr, Var))
 		{
 			Var *var = (Var *) tle->expr;
+			int32 isOuter = (var->varno == outerRelid) ? 1 : 0;
+
 			cscan->custom_private = lappend(cscan->custom_private,
 				makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
-						  Int32GetDatum(var->varno), false, true));
+						  Int32GetDatum(isOuter), false, true));
 			cscan->custom_private = lappend(cscan->custom_private,
 				makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
 						  Int16GetDatum(var->varattno), false, true));
 		}
 		else
 		{
-			/* Non-Var expression - mark as special */
+			/* Non-Var expression - mark as special (-1) */
 			cscan->custom_private = lappend(cscan->custom_private,
 				makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
 						  Int32GetDatum(-1), false, true));
@@ -782,7 +806,13 @@ bktree_batch_join_plan(PlannerInfo *root,
 	 */
 	cscan->scan.plan.targetlist = copyObject(tlist);
 	cscan->custom_scan_tlist = scan_tlist;
-	cscan->custom_plans = list_make1(outerPlan);
+
+	/*
+	 * Include both child plans. The inner plan exists for planner legality
+	 * (shows we "access" the inner relation) but is not executed - we use
+	 * the batch index search instead.
+	 */
+	cscan->custom_plans = custom_plans;
 	cscan->methods = &bktree_batch_join_scan_methods;
 
 	return (Plan *) cscan;
@@ -812,7 +842,6 @@ bktree_batch_join_begin(CustomScanState *node, EState *estate, int eflags)
 	BktreeBatchJoinState *state = (BktreeBatchJoinState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	List	   *priv = cscan->custom_private;
-	Plan	   *outerPlan;
 	Expr	   *distanceExpr;
 	List	   *tlist;
 	int			ncolumns;
@@ -822,14 +851,14 @@ bktree_batch_join_begin(CustomScanState *node, EState *estate, int eflags)
 	/* Extract fixed private data using named indices */
 	state->indexOid = PRIVATE_GET_OID(priv, PRIVATE_INDEX_OID);
 	state->indexedAttno = PRIVATE_GET_INT16(priv, PRIVATE_INDEXED_ATTNO);
-	state->innerRelid = PRIVATE_GET_INT32(priv, PRIVATE_INNER_RELID);
+	state->innerTableOid = PRIVATE_GET_OID(priv, PRIVATE_INNER_TABLE_OID);
 	state->outerVarAttno = PRIVATE_GET_INT16(priv, PRIVATE_OUTER_VAR_ATTNO);
-	state->outerRelid = PRIVATE_GET_INT32(priv, PRIVATE_OUTER_RELID);
 	distanceExpr = (Expr *) list_nth(priv, PRIVATE_DISTANCE_EXPR);
+	/* PRIVATE_INNER_RELID and PRIVATE_OUTER_RELID are only for plan-time */
 
 	/*
 	 * Extract column mappings from custom_private.
-	 * After the fixed entries, we have pairs of (varno INT4, varattno INT2).
+	 * After the fixed entries, we have pairs of (isOuter INT4, varattno INT2).
 	 */
 	tlist = cscan->scan.plan.targetlist;
 	ncolumns = list_length(tlist);
@@ -839,7 +868,7 @@ bktree_batch_join_begin(CustomScanState *node, EState *estate, int eflags)
 	privIdx = PRIVATE_COL_MAPPINGS;
 	for (i = 0; i < ncolumns; i++)
 	{
-		state->colMappings[i].varno = PRIVATE_GET_INT32(priv, privIdx);
+		state->colMappings[i].isOuter = PRIVATE_GET_INT32(priv, privIdx);
 		state->colMappings[i].varattno = PRIVATE_GET_INT16(priv, privIdx + 1);
 		privIdx += 2;
 	}
@@ -850,18 +879,20 @@ bktree_batch_join_begin(CustomScanState *node, EState *estate, int eflags)
 	/* Open index */
 	state->index = index_open(state->indexOid, AccessShareLock);
 
-	/* Open inner relation (for heap fetches) */
-	{
-		RangeTblEntry *rte = exec_rt_fetch(state->innerRelid, estate);
-		state->innerRel = table_open(rte->relid, AccessShareLock);
-		/* Create a slot suitable for this relation's tuples */
-		state->innerSlot = table_slot_create(state->innerRel,
-											 &estate->es_tupleTable);
-	}
+	/*
+	 * Open inner relation using the stable table OID.
+	 * This works regardless of UNION/subquery embedding.
+	 */
+	state->innerRel = table_open(state->innerTableOid, AccessShareLock);
+	state->innerSlot = table_slot_create(state->innerRel,
+										 &estate->es_tupleTable);
 
-	/* Initialize outer plan */
-	outerPlan = linitial(cscan->custom_plans);
-	state->outerPlan = ExecInitNode(outerPlan, estate, eflags);
+	/*
+	 * Initialize child plans. The inner plan is kept for planner legality
+	 * but is not executed - we use batch index search instead.
+	 */
+	state->outerPlan = ExecInitNode(linitial(cscan->custom_plans), estate, eflags);
+	state->innerPlan = ExecInitNode(lsecond(cscan->custom_plans), estate, eflags);
 
 	/* Create memory context for batch data (targets and results) */
 	state->batchContext = AllocSetContextCreate(estate->es_query_cxt,
@@ -1013,7 +1044,8 @@ bktree_batch_join_next(CustomScanState *node)
 
 		/*
 		 * Build the scan tuple using the cached column mappings.
-		 * Each column comes from either inner relation or is the target hash.
+		 * Each column comes from either inner relation (isOuter=0) or
+		 * outer relation / target hash (isOuter=1).
 		 */
 		ExecClearTuple(scanSlot);
 
@@ -1023,12 +1055,12 @@ bktree_batch_join_next(CustomScanState *node)
 			Datum		val;
 			bool		isnull;
 
-			if ((Index) cm->varno == state->innerRelid)
+			if (cm->isOuter == 0)
 			{
 				/* Column from inner relation */
 				val = slot_getattr(state->innerSlot, cm->varattno, &isnull);
 			}
-			else if ((Index) cm->varno == state->outerRelid)
+			else if (cm->isOuter == 1)
 			{
 				/* Column from outer relation (target hash) */
 				val = Int64GetDatum(r->target_hash);
@@ -1036,7 +1068,7 @@ bktree_batch_join_next(CustomScanState *node)
 			}
 			else
 			{
-				elog(ERROR, "bktree: unexpected varno %d in column mapping", cm->varno);
+				elog(ERROR, "bktree: unexpected isOuter %d in column mapping", cm->isOuter);
 			}
 
 			scanSlot->tts_values[i] = val;
@@ -1066,9 +1098,11 @@ bktree_batch_join_end(CustomScanState *node)
 {
 	BktreeBatchJoinState *state = (BktreeBatchJoinState *) node;
 
-	/* End outer plan */
+	/* End child plans */
 	if (state->outerPlan)
 		ExecEndNode(state->outerPlan);
+	if (state->innerPlan)
+		ExecEndNode(state->innerPlan);
 
 	/* Close relations */
 	if (state->index)
@@ -1107,9 +1141,11 @@ bktree_batch_join_rescan(CustomScanState *node)
 	state->curr_result = 0;
 	state->search_done = false;
 
-	/* Rescan outer */
+	/* Rescan child plans */
 	if (state->outerPlan)
 		ExecReScan(state->outerPlan);
+	if (state->innerPlan)
+		ExecReScan(state->innerPlan);
 }
 
 /*
