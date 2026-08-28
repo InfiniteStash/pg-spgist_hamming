@@ -248,6 +248,16 @@ bktree_inner_consistent(PG_FUNCTION_ARGS)
 
 	fprintf_to_ereport("bktree_inner_consistent");
 
+	/* A constraint-free SP-GiST scan must visit every child node. */
+	if (in->nkeys == 0)
+	{
+		out->nNodes = in->nNodes;
+		out->nodeNumbers = (int *) palloc(sizeof(int) * in->nNodes);
+		for (i = 0; i < in->nNodes; i++)
+			out->nodeNumbers[i] = i;
+		PG_RETURN_VOID();
+	}
+
 	if (in->allTheSame)
 	{
 		fprintf_to_ereport("in->allTheSame is true");
@@ -345,6 +355,9 @@ bktree_leaf_consistent(PG_FUNCTION_ARGS)
 	out->leafValue = in->leafDatum;
 
 	fprintf_to_ereport("bktree_leaf_consistent with %d keys", in->nkeys);
+
+	if (in->nkeys == 0)
+		PG_RETURN_BOOL(true);
 
 	for (i = 0; i < in->nkeys; i++)
 	{
