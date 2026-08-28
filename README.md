@@ -73,7 +73,3 @@ JOIN fingerprints AS fp
   ON fp.hash <@ (query.phash, $2)::bktree_area
  AND fp.algorithm = 'PHASH';
 ```
-
-Reproducible synthetic and Stash Box workloads are in
-[`benchmarks/`](benchmarks/README.md). The measured staging results are recorded
-in [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
