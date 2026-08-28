@@ -41,6 +41,16 @@ typedef struct BatchStackItem
 	uint64		activeTargets;	/* bitmask of targets still searching this path */
 } BatchStackItem;
 
+/* Dynamically sized traversal stack. */
+typedef struct BatchTraversalStack
+{
+	BatchStackItem *items;
+	int			depth;
+	int			capacity;
+} BatchTraversalStack;
+
+#define INITIAL_STACK_CAPACITY 256
+
 /* Cached OIDs for extension types/operators */
 static Oid	CachedBktreeAreaTypeOid = InvalidOid;
 static Oid	CachedBktreeContainmentOpOid = InvalidOid;
@@ -109,30 +119,72 @@ add_result(BatchSearchState *state, int64 target, int64 match, ItemPointer tid)
 	state->nresults++;
 }
 
+/* Add an item, growing the stack rather than silently dropping work. */
+static void
+push_stack_item(BatchTraversalStack *stack, BlockNumber blkno,
+				OffsetNumber offset, uint64 activeTargets)
+{
+	BatchStackItem *item;
+
+	if (activeTargets == 0 || !BlockNumberIsValid(blkno))
+		return;
+
+	if (stack->depth == stack->capacity)
+	{
+		stack->capacity *= 2;
+		stack->items = repalloc(stack->items,
+								  sizeof(BatchStackItem) * stack->capacity);
+	}
+
+	item = &stack->items[stack->depth++];
+	item->blkno = blkno;
+	item->offset = offset;
+	item->activeTargets = activeTargets;
+}
+
+/* Remove a queued item for a particular block, if one exists. */
+static bool
+pop_stack_item_for_block(BatchTraversalStack *stack, BlockNumber blkno,
+						 BatchStackItem *item)
+{
+	int			i;
+
+	for (i = stack->depth - 1; i >= 0; i--)
+	{
+		if (stack->items[i].blkno == blkno)
+		{
+			*item = stack->items[i];
+			stack->depth--;
+			if (i != stack->depth)
+				stack->items[i] = stack->items[stack->depth];
+			return true;
+		}
+	}
+
+	return false;
+}
+
 /*
- * Process leaf tuples starting at given offset, following the chain
+ * Process an on-page leaf chain.  The caller owns the buffer lock; redirects
+ * are queued so other pending work can continue to share the current page.
  */
 static void
-process_leaf_chain(BatchSearchState *state, Relation index,
-				   BlockNumber blkno, OffsetNumber startOffset,
-				   uint64 activeTargets)
+process_leaf_chain(BatchSearchState *state, Page page,
+				   OffsetNumber startOffset, uint64 activeTargets,
+				   BatchTraversalStack *stack)
 {
-	Buffer		buffer;
-	Page		page;
-	OffsetNumber offset;
+	OffsetNumber offset = startOffset;
+	OffsetNumber maxOffset = PageGetMaxOffsetNumber(page);
 
-	buffer = ReadBuffer(index, blkno);
-	LockBuffer(buffer, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buffer);
-
-	offset = startOffset;
 	while (offset != InvalidOffsetNumber)
 	{
 		SpGistLeafTuple leafTuple;
 		ItemId		itemId;
 		int64		leafHash;
-		int			i;
-		uint64		mask;
+		uint64		remainingTargets;
+
+		if (offset < FirstOffsetNumber || offset > maxOffset)
+			break;
 
 		itemId = PageGetItemId(page, offset);
 		if (!ItemIdIsUsed(itemId))
@@ -142,172 +194,145 @@ process_leaf_chain(BatchSearchState *state, Relation index,
 
 		if (leafTuple->tupstate != SPGIST_LIVE)
 		{
-			/* Handle redirect */
 			if (leafTuple->tupstate == SPGIST_REDIRECT)
 			{
 				SpGistDeadTuple dt = (SpGistDeadTuple) leafTuple;
-				BlockNumber newBlk = ItemPointerGetBlockNumber(&dt->pointer);
-				OffsetNumber newOff = ItemPointerGetOffsetNumber(&dt->pointer);
-				UnlockReleaseBuffer(buffer);
-				/* Follow redirect recursively */
-				process_leaf_chain(state, index, newBlk, newOff, activeTargets);
+
+				push_stack_item(stack,
+							ItemPointerGetBlockNumber(&dt->pointer),
+							ItemPointerGetOffsetNumber(&dt->pointer),
+							activeTargets);
 				return;
 			}
 			offset = SGLT_GET_NEXTOFFSET(leafTuple);
 			continue;
 		}
 
-		/* Extract the leaf datum (int64 hash) */
 		leafHash = DatumGetInt64(SGLTDATUM(leafTuple, &state->spgstate));
 
-		/* Check against all active targets */
-		mask = 1;
-		for (i = 0; i < state->ntargets; i++, mask <<= 1)
+		/* Check only targets whose bits remain active on this path. */
+		remainingTargets = activeTargets;
+		while (remainingTargets != 0)
 		{
-			if (activeTargets & mask)
-			{
-				int dist = hamming_distance(leafHash, state->targets[i]);
-				if (dist <= state->distance)
-				{
-					add_result(state, state->targets[i], leafHash,
-							   &leafTuple->heapPtr);
-				}
-			}
+			int			i = __builtin_ctzll(remainingTargets);
+			int			dist = hamming_distance(leafHash, state->targets[i]);
+
+			if (dist <= state->distance)
+				add_result(state, state->targets[i], leafHash,
+						   &leafTuple->heapPtr);
+
+			remainingTargets &= remainingTargets - 1;
 		}
 
-		/* Follow chain to next tuple */
 		offset = SGLT_GET_NEXTOFFSET(leafTuple);
 	}
-
-	UnlockReleaseBuffer(buffer);
 }
 
-/*
- * Recursive traversal of inner nodes
- */
+/* Process one inner tuple while the caller holds the page buffer lock. */
 static void
-traverse_inner(BatchSearchState *state, Relation index,
-			   BlockNumber blkno, OffsetNumber offset,
-			   uint64 activeTargets,
-			   BatchStackItem *stack, int *stackDepth, int maxStack)
+process_inner_tuple(BatchSearchState *state, Page page, OffsetNumber offset,
+					uint64 activeTargets, BatchTraversalStack *stack)
 {
-	Buffer		buffer;
-	Page		page;
 	SpGistInnerTuple innerTuple;
 	ItemId		itemId;
 	int64		prefix;
-	int			i;
-	uint64		mask;
+	uint64		remainingTargets;
 	SpGistNodeTuple node;
 	int			nodeN;
 	uint64		nodeTargets[65];
+	OffsetNumber maxOffset = PageGetMaxOffsetNumber(page);
 
-	if (activeTargets == 0 || *stackDepth >= maxStack - 65)
+	if (activeTargets == 0 || offset < FirstOffsetNumber || offset > maxOffset)
 		return;
-
-	buffer = ReadBuffer(index, blkno);
-	LockBuffer(buffer, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buffer);
-
-	/* Check if this is actually a leaf page */
-	if (SpGistPageIsLeaf(page))
-	{
-		UnlockReleaseBuffer(buffer);
-		process_leaf_chain(state, index, blkno, offset, activeTargets);
-		return;
-	}
 
 	itemId = PageGetItemId(page, offset);
 	if (!ItemIdIsUsed(itemId))
-	{
-		UnlockReleaseBuffer(buffer);
 		return;
-	}
 
 	innerTuple = (SpGistInnerTuple) PageGetItem(page, itemId);
 
 	if (innerTuple->tupstate != SPGIST_LIVE)
 	{
-		/* Handle redirect */
 		if (innerTuple->tupstate == SPGIST_REDIRECT)
 		{
 			SpGistDeadTuple dt = (SpGistDeadTuple) innerTuple;
-			BlockNumber newBlk = ItemPointerGetBlockNumber(&dt->pointer);
-			OffsetNumber newOff = ItemPointerGetOffsetNumber(&dt->pointer);
-			UnlockReleaseBuffer(buffer);
-			traverse_inner(state, index, newBlk, newOff, activeTargets,
-						   stack, stackDepth, maxStack);
-			return;
+
+			push_stack_item(stack,
+						ItemPointerGetBlockNumber(&dt->pointer),
+						ItemPointerGetOffsetNumber(&dt->pointer),
+						activeTargets);
 		}
-		UnlockReleaseBuffer(buffer);
 		return;
 	}
 
-	/* Initialize nodeTargets */
 	memset(nodeTargets, 0, sizeof(nodeTargets));
 
-	/* Handle allTheSame case */
 	if (innerTuple->allTheSame)
 	{
-		/* All nodes equivalent - visit first node with all active targets */
 		SGITITERATE(innerTuple, nodeN, node)
 		{
-			BlockNumber childBlk = ItemPointerGetBlockNumber(&node->t_tid);
-			OffsetNumber childOff = ItemPointerGetOffsetNumber(&node->t_tid);
-
-			if (BlockNumberIsValid(childBlk))
-			{
-				stack[*stackDepth].blkno = childBlk;
-				stack[*stackDepth].offset = childOff;
-				stack[*stackDepth].activeTargets = activeTargets;
-				(*stackDepth)++;
-			}
+			push_stack_item(stack,
+							ItemPointerGetBlockNumber(&node->t_tid),
+							ItemPointerGetOffsetNumber(&node->t_tid),
+							activeTargets);
 		}
-		UnlockReleaseBuffer(buffer);
 		return;
 	}
 
-	/* Get the prefix datum (the pivot hash for this node) */
 	prefix = DatumGetInt64(SGITDATUM(innerTuple, &state->spgstate));
 
-	/*
-	 * For each target, compute distance to prefix and determine which
-	 * child nodes need to be visited.
-	 */
-	mask = 1;
-	for (i = 0; i < state->ntargets; i++, mask <<= 1)
+	remainingTargets = activeTargets;
+	while (remainingTargets != 0)
 	{
-		if (activeTargets & mask)
-		{
-			int dist = hamming_distance(prefix, state->targets[i]);
-			int minDist = (dist > state->distance) ? (dist - state->distance) : 0;
-			int maxDist = (dist + state->distance > 64) ? 64 : (dist + state->distance);
-			int d;
+		int			i = __builtin_ctzll(remainingTargets);
+		uint64		mask = UINT64CONST(1) << i;
+		int			dist = hamming_distance(prefix, state->targets[i]);
+		int			minDist = (dist > state->distance) ?
+			(dist - state->distance) : 0;
+		int			maxDist = (dist + state->distance > 64) ?
+			64 : (dist + state->distance);
+		int			d;
 
-			for (d = minDist; d <= maxDist; d++)
-			{
-				nodeTargets[d] |= mask;
-			}
-		}
+		for (d = minDist; d <= maxDist; d++)
+			nodeTargets[d] |= mask;
+
+		remainingTargets &= remainingTargets - 1;
 	}
 
-	/* Queue children that have active targets */
 	SGITITERATE(innerTuple, nodeN, node)
 	{
 		if (nodeN < 65 && nodeTargets[nodeN] != 0)
 		{
-			BlockNumber childBlk = ItemPointerGetBlockNumber(&node->t_tid);
-			OffsetNumber childOff = ItemPointerGetOffsetNumber(&node->t_tid);
-
-			if (BlockNumberIsValid(childBlk))
-			{
-				stack[*stackDepth].blkno = childBlk;
-				stack[*stackDepth].offset = childOff;
-				stack[*stackDepth].activeTargets = nodeTargets[nodeN];
-				(*stackDepth)++;
-			}
+			push_stack_item(stack,
+							ItemPointerGetBlockNumber(&node->t_tid),
+							ItemPointerGetOffsetNumber(&node->t_tid),
+							nodeTargets[nodeN]);
 		}
 	}
+}
+
+/* Process all currently queued work for one block under one buffer lock. */
+static void
+process_block(BatchSearchState *state, BatchTraversalStack *stack,
+			  BatchStackItem item)
+{
+	Buffer		buffer;
+	Page		page;
+	BlockNumber blkno = item.blkno;
+
+	buffer = ReadBuffer(state->index, blkno);
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buffer);
+
+	do
+	{
+		if (SpGistPageIsLeaf(page))
+			process_leaf_chain(state, page, item.offset,
+							   item.activeTargets, stack);
+		else
+			process_inner_tuple(state, page, item.offset,
+								item.activeTargets, stack);
+	} while (pop_stack_item_for_block(stack, blkno, &item));
 
 	UnlockReleaseBuffer(buffer);
 }
@@ -334,11 +359,6 @@ bktree_batch_search(PG_FUNCTION_ARGS)
 		Datum	   *targetDatums;
 		bool	   *targetNulls;
 		int			i;
-
-		/* Stack for iterative traversal */
-		BatchStackItem *stack;
-		int			stackDepth;
-		int			maxStack;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
@@ -387,35 +407,7 @@ bktree_batch_search(PG_FUNCTION_ARGS)
 		state->nresults = 0;
 		state->index = index;
 
-		initSpGistState(&state->spgstate, index);
-
-		/* Allocate traversal stack */
-		maxStack = 65 * 100;  /* Should be plenty */
-		stack = palloc(sizeof(BatchStackItem) * maxStack);
-		stackDepth = 0;
-
-		/* Start with root */
-		stack[stackDepth].blkno = SPGIST_ROOT_BLKNO;
-		stack[stackDepth].offset = FirstOffsetNumber;
-		stack[stackDepth].activeTargets = (ntargets == 64) ? ~0ULL : ((1ULL << ntargets) - 1);
-		stackDepth++;
-
-		/* Iterative DFS traversal using stack */
-		while (stackDepth > 0)
-		{
-			BatchStackItem item;
-
-			stackDepth--;
-			item = stack[stackDepth];
-
-			if (item.activeTargets == 0)
-				continue;
-
-			traverse_inner(state, index, item.blkno, item.offset,
-						   item.activeTargets, stack, &stackDepth, maxStack);
-		}
-
-		pfree(stack);
+		bktree_batch_execute(state);
 
 		/* Build result tuple descriptor */
 		tupdesc = CreateTemplateTupleDesc(3);
@@ -555,39 +547,38 @@ find_bktree_index(Oid tableOid, const char *columnName)
 void
 bktree_batch_execute(BatchSearchState *state)
 {
-	BatchStackItem *stack;
-	int			stackDepth;
-	int			maxStack;
+	BatchTraversalStack stack;
+	uint64		activeTargets;
+
+	if (state->ntargets < 0 || state->ntargets > MAX_BATCH_TARGETS)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("too many targets, maximum is %d", MAX_BATCH_TARGETS)));
+
+	if (state->ntargets == 0)
+		return;
 
 	initSpGistState(&state->spgstate, state->index);
 
-	/* Allocate traversal stack */
-	maxStack = 65 * 100;
-	stack = palloc(sizeof(BatchStackItem) * maxStack);
-	stackDepth = 0;
+	stack.capacity = INITIAL_STACK_CAPACITY;
+	stack.depth = 0;
+	stack.items = palloc(sizeof(BatchStackItem) * stack.capacity);
 
 	/* Start with root */
-	stack[stackDepth].blkno = SPGIST_ROOT_BLKNO;
-	stack[stackDepth].offset = FirstOffsetNumber;
-	stack[stackDepth].activeTargets = (state->ntargets == 64) ? ~0ULL : ((1ULL << state->ntargets) - 1);
-	stackDepth++;
+	activeTargets = (state->ntargets == MAX_BATCH_TARGETS) ?
+		UINT64_MAX : ((UINT64CONST(1) << state->ntargets) - 1);
+	push_stack_item(&stack, SPGIST_ROOT_BLKNO, FirstOffsetNumber,
+					activeTargets);
 
-	/* Iterative DFS traversal using stack */
-	while (stackDepth > 0)
+	while (stack.depth > 0)
 	{
 		BatchStackItem item;
 
-		stackDepth--;
-		item = stack[stackDepth];
-
-		if (item.activeTargets == 0)
-			continue;
-
-		traverse_inner(state, state->index, item.blkno, item.offset,
-					   item.activeTargets, stack, &stackDepth, maxStack);
+		item = stack.items[--stack.depth];
+		process_block(state, &stack, item);
 	}
 
-	pfree(stack);
+	pfree(stack.items);
 }
 
 /*

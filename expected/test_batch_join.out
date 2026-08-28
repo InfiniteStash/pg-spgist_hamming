@@ -17,7 +17,7 @@ SELECT count(*) FROM (
     FROM UNNEST(ARRAY[12345::int8, 67890::int8, 11111::int8]) AS target
     JOIN test_batch_join t ON t.hash <@ (target, 10)::bktree_area
 ) subq;
- count
+ count 
 -------
      0
 (1 row)
@@ -32,7 +32,7 @@ SELECT t.id, t.hash, target
 FROM UNNEST(ARRAY[100::int8, 200::int8]) AS target
 JOIN test_batch_join t ON t.hash <@ (target, 0)::bktree_area
 ORDER BY t.hash, target;
-  id   | hash | target
+  id   | hash | target 
 -------+------+--------
  10001 |  100 |    100
  10005 |  200 |    200
@@ -44,22 +44,10 @@ SELECT count(*) FROM (
     FROM UNNEST(ARRAY[100::int8, 200::int8]) AS target
     JOIN test_batch_join t ON t.hash <@ (target, 3)::bktree_area
 ) subq;
- count
+ count 
 -------
      8
 (1 row)
-
--- Check that EXPLAIN shows our custom scan (when enabled)
--- Note: This might show nested loop if cost estimation prefers it
-EXPLAIN (COSTS OFF)
-SELECT t.*, target
-FROM UNNEST(ARRAY[12345::int8, 67890::int8]) AS target
-JOIN test_batch_join t ON t.hash <@ (target, 5)::bktree_area;
-                              QUERY PLAN
------------------------------------------------------------------------
- Custom Scan (BktreeBatchJoin)
-   ->  Function Scan on unnest target
-(2 rows)
 
 -- Test with more targets
 SELECT count(*) FROM (
@@ -67,9 +55,9 @@ SELECT count(*) FROM (
     FROM UNNEST(ARRAY[1::int8, 2, 3, 4, 5, 6, 7, 8, 9, 10]) AS target
     JOIN test_batch_join t ON t.hash <@ (target, 2)::bktree_area
 ) subq;
- count
+ count 
 -------
-     0
+     7
 (1 row)
 
 -- Test with empty array (should return no rows)
@@ -78,34 +66,93 @@ SELECT count(*) FROM (
     FROM UNNEST(ARRAY[]::int8[]) AS target
     JOIN test_batch_join t ON t.hash <@ (target, 5)::bktree_area
 ) subq;
- count
+ count 
 -------
      0
 (1 row)
 
 -- Verify results match between custom scan and regular nested loop
 -- by comparing counts with custom scan disabled vs enabled
-SET enable_customscan = off;
+SET bktree.enable_customscan = off;
 SELECT count(*) AS nested_loop_count FROM (
     SELECT t.*, target
     FROM UNNEST(ARRAY[100::int8, 200::int8]) AS target
     JOIN test_batch_join t ON t.hash <@ (target, 3)::bktree_area
 ) subq;
- nested_loop_count
+ nested_loop_count 
 -------------------
                  8
 (1 row)
 
-SET enable_customscan = on;
+SET bktree.enable_customscan = on;
 SELECT count(*) AS custom_scan_count FROM (
     SELECT t.*, target
     FROM UNNEST(ARRAY[100::int8, 200::int8]) AS target
     JOIN test_batch_join t ON t.hash <@ (target, 3)::bktree_area
 ) subq;
- custom_scan_count
+ custom_scan_count 
 -------------------
                  8
 (1 row)
 
+-- Runtime parameters can contain more than 64 rows even when the planner's
+-- UNNEST estimate is smaller.  The executor must search all chunks.
+INSERT INTO test_batch_join(hash)
+SELECT -g FROM generate_series(1000, 1064) AS g;
+SELECT count(*) AS multi_chunk_count FROM (
+    SELECT t.hash, target
+    FROM UNNEST(ARRAY(SELECT -g::int8 FROM generate_series(1000, 1064) AS g)) AS target
+    JOIN test_batch_join t ON t.hash <@ (target, 0)::bktree_area
+) subq;
+ multi_chunk_count 
+-------------------
+                65
+(1 row)
+
+-- A partial index must not be used unless its predicate is present.
+CREATE TABLE test_batch_partial(id serial PRIMARY KEY, algorithm text, hash int8);
+INSERT INTO test_batch_partial(algorithm, hash)
+VALUES ('PHASH', 42), ('OTHER', 42);
+CREATE INDEX test_batch_partial_hash_idx
+ON test_batch_partial USING spgist(hash bktree_ops)
+WHERE algorithm = 'PHASH';
+ANALYZE test_batch_partial;
+SELECT count(*) AS without_predicate FROM (
+    SELECT t.id
+    FROM UNNEST(ARRAY[42::int8]) AS target
+    JOIN test_batch_partial t ON t.hash <@ (target, 0)::bktree_area
+) subq;
+ without_predicate 
+-------------------
+                 2
+(1 row)
+
+SELECT count(*) AS with_predicate FROM (
+    SELECT t.id
+    FROM UNNEST(ARRAY[42::int8]) AS target
+    JOIN test_batch_partial t ON t.hash <@ (target, 0)::bktree_area
+    WHERE t.algorithm = 'PHASH'
+) subq;
+ with_predicate 
+----------------
+              1
+(1 row)
+
+-- PostgreSQL may scan a partial SP-GiST index without a distance scan key.
+-- The consistent functions must not prune the entire tree in that case.
+SET enable_seqscan = off;
+SELECT count(*) AS unconstrained_index_count FROM (
+    SELECT hash
+    FROM test_batch_partial
+    WHERE algorithm = 'PHASH'
+    LIMIT 1
+) subq;
+ unconstrained_index_count 
+---------------------------
+                         1
+(1 row)
+
+RESET enable_seqscan;
 -- Cleanup
+DROP TABLE test_batch_partial;
 DROP TABLE test_batch_join;

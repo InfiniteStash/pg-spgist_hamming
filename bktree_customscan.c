@@ -25,6 +25,7 @@
 #include "access/genam.h"
 #include "access/table.h"
 #include "catalog/indexing.h"
+#include "catalog/index.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opclass.h"
@@ -46,6 +47,7 @@
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -63,6 +65,7 @@ static void bktree_join_pathlist_hook(PlannerInfo *root,
 
 /* Previous hook for chaining */
 static set_join_pathlist_hook_type prev_join_hook = NULL;
+static bool bktree_enable_customscan = true;
 
 /*
  * Information extracted from a matching join pattern
@@ -163,6 +166,9 @@ typedef struct BktreeBatchJoinState
 	/* For heap tuple fetch */
 	Relation	innerRel;
 	TupleTableSlot *innerSlot;	/* Slot for fetched heap tuples */
+	ItemPointerData lastFetchTid;	/* Cache repeated fetches after TID sort */
+	bool		lastFetchValid;
+	bool		lastFetchFound;
 	Oid			indexOid;
 	AttrNumber	indexedAttno;
 
@@ -225,6 +231,17 @@ static const CustomExecMethods bktree_batch_join_exec_methods = {
 void
 bktree_register_hooks(void)
 {
+	DefineCustomBoolVariable("bktree.enable_customscan",
+							 "Enable the BK-tree batched custom join plan.",
+							 NULL,
+							 &bktree_enable_customscan,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	/* Register custom scan provider */
 	RegisterCustomScanMethods(&bktree_batch_join_scan_methods);
 
@@ -287,6 +304,18 @@ find_bktree_index_for_rel(RelOptInfo *rel, AttrNumber *indexedAttno)
 
 		/* Must have at least one column */
 		if (index->nkeycolumns < 1)
+			continue;
+
+		/*
+		 * The executor traverses the index directly and does not run an inner
+		 * base-relation qual.  A partial index is therefore safe only when its
+		 * predicate is implied by the query, and any remaining base restrictions
+		 * must already be implied by that predicate.  indrestrictinfo is exactly
+		 * the set PostgreSQL says still needs to be checked.
+		 */
+		if (index->indpred != NIL && !index->predOK)
+			continue;
+		if (index->indrestrictinfo != NIL)
 			continue;
 
 		/*
@@ -509,11 +538,59 @@ is_bktree_batch_join(PlannerInfo *root,
 									 indexedAttno, &info->distanceExpr,
 									 &info->outerVar))
 		{
+			/*
+			 * The custom executor implements the containment clause itself, but
+			 * has no generic join-qual evaluator.  Fall back if another join
+			 * clause would also need to be checked.
+			 */
+			if (list_length(restrictlist) != 1)
+				return false;
+			if (contain_var_clause((Node *) info->distanceExpr))
+				return false;
+
 			info->joinClause = rinfo;
 			return true;
 		}
 	}
 	return false;
+}
+
+/*
+ * BatchResult retains the searched hash, not an arbitrary outer tuple.  Only
+ * the UNNEST target itself can therefore be projected from the outer side.
+ * Reject WITH ORDINALITY and other extra outer columns rather than returning
+ * the target hash in their place.  Non-Var join targets are likewise left to
+ * PostgreSQL's regular executor.
+ */
+static bool
+batch_join_target_is_supported(RelOptInfo *joinrel, RelOptInfo *outerrel,
+							   RelOptInfo *innerrel, Var *outerVar)
+{
+	ListCell   *lc;
+
+	foreach(lc, joinrel->reltarget->exprs)
+	{
+		Node	   *expr = (Node *) lfirst(lc);
+		Var		   *var;
+
+		while (IsA(expr, RelabelType))
+			expr = (Node *) ((RelabelType *) expr)->arg;
+
+		if (!IsA(expr, Var))
+			return false;
+
+		var = (Var *) expr;
+		if (bms_is_member(var->varno, outerrel->relids))
+		{
+			if (var->varno != outerVar->varno ||
+				var->varattno != outerVar->varattno)
+				return false;
+		}
+		else if (!bms_is_member(var->varno, innerrel->relids))
+			return false;
+	}
+
+	return true;
 }
 
 /*
@@ -531,6 +608,7 @@ cost_bktree_batch_join(PlannerInfo *root,
 	double		outer_rows = outerrel->rows;
 	double		index_pages;
 	double		result_rows;
+	double		batch_count;
 
 	/* Must materialize outer first */
 	startup_cost += path->outerpath->total_cost;
@@ -547,13 +625,14 @@ cost_bktree_batch_join(PlannerInfo *root,
 	 * A single traversal visits far fewer pages than N separate scans.
 	 */
 	index_pages = Max(5.0, log(innerrel->tuples + 1) * 2);
+	batch_count = Max(1.0, ceil(outer_rows / MAX_BATCH_TARGETS));
 
 	/*
 	 * Index I/O cost: single traversal for all targets.
 	 * This is the main advantage - N targets share the same traversal cost.
 	 * Use seq_page_cost since traversal is mostly sequential within the index.
 	 */
-	run_cost += index_pages * seq_page_cost;
+	run_cost += index_pages * batch_count * seq_page_cost;
 
 	/* CPU cost: at each node, check all targets (cheap hamming distance) */
 	run_cost += index_pages * outer_rows * cpu_operator_cost * 0.1;
@@ -593,12 +672,6 @@ create_bktree_batch_join_path(PlannerInfo *root,
 	/* Get cheapest outer path */
 	outerpath = outerrel->cheapest_total_path;
 	if (outerpath == NULL)
-	{
-		return;
-	}
-
-	/* Limit to MAX_BATCH_TARGETS rows */
-	if (outerrel->rows > MAX_BATCH_TARGETS)
 	{
 		return;
 	}
@@ -652,6 +725,9 @@ bktree_join_pathlist_hook(PlannerInfo *root,
 	if (prev_join_hook)
 		prev_join_hook(root, joinrel, outerrel, innerrel, jointype, extra);
 
+	if (!bktree_enable_customscan)
+		return;
+
 	/* Only optimize inner joins for now */
 	if (jointype != JOIN_INNER)
 		return;
@@ -672,6 +748,10 @@ bktree_join_pathlist_hook(PlannerInfo *root,
 		outerrel = innerrel;
 		innerrel = tmp;
 	}
+
+	if (!batch_join_target_is_supported(joinrel, outerrel, innerrel,
+									 info.outerVar))
+		return;
 
 	/* Create and add custom join path */
 	create_bktree_batch_join_path(root, joinrel, outerrel, innerrel, &info);
@@ -852,8 +932,14 @@ bktree_batch_join_begin(CustomScanState *node, EState *estate, int eflags)
 
 	/* Open inner relation (for heap fetches) */
 	{
-		RangeTblEntry *rte = exec_rt_fetch(state->innerRelid, estate);
-		state->innerRel = table_open(rte->relid, AccessShareLock);
+		/*
+		 * Derive the heap OID from the index.  A raw RT index stored in
+		 * custom_private is local to its PlannerInfo and can point at a
+		 * different final range-table entry when this join is inside a subquery.
+		 */
+		Oid			heapOid = IndexGetRelation(state->indexOid, false);
+
+		state->innerRel = table_open(heapOid, AccessShareLock);
 		/* Create a slot suitable for this relation's tuples */
 		state->innerSlot = table_slot_create(state->innerRel,
 											 &estate->es_tupleTable);
@@ -879,6 +965,8 @@ bktree_batch_join_begin(CustomScanState *node, EState *estate, int eflags)
 	state->nresults = 0;
 	state->curr_result = 0;
 	state->search_done = false;
+	state->lastFetchValid = false;
+	state->lastFetchFound = false;
 }
 
 /*
@@ -901,17 +989,16 @@ collect_targets(BktreeBatchJoinState *state)
 		if (isnull)
 			continue;
 
-		/* Grow targets array if needed */
+		/* Grow the input buffer; execution traverses it in 64-target chunks. */
 		if (state->ntargets >= state->max_targets)
 		{
 			int		new_max = state->max_targets * 2;
 			int64  *new_targets;
 
 			new_targets = MemoryContextAlloc(state->batchContext,
-											 sizeof(int64) * new_max);
+										 sizeof(int64) * new_max);
 			memcpy(new_targets, state->targets,
 				   sizeof(int64) * state->ntargets);
-			/* Old array will be freed when context is reset */
 			state->targets = new_targets;
 			state->max_targets = new_max;
 		}
@@ -933,6 +1020,27 @@ collect_targets(BktreeBatchJoinState *state)
 
 }
 
+static int
+compare_batch_results_by_tid(const void *left, const void *right)
+{
+	const BatchResult *leftResult = (const BatchResult *) left;
+	const BatchResult *rightResult = (const BatchResult *) right;
+	BlockNumber leftBlock = ItemPointerGetBlockNumber(&leftResult->heap_tid);
+	BlockNumber rightBlock = ItemPointerGetBlockNumber(&rightResult->heap_tid);
+	OffsetNumber leftOffset = ItemPointerGetOffsetNumber(&leftResult->heap_tid);
+	OffsetNumber rightOffset = ItemPointerGetOffsetNumber(&rightResult->heap_tid);
+
+	if (leftBlock < rightBlock)
+		return -1;
+	if (leftBlock > rightBlock)
+		return 1;
+	if (leftOffset < rightOffset)
+		return -1;
+	if (leftOffset > rightOffset)
+		return 1;
+	return 0;
+}
+
 /*
  * Execute batch search.
  */
@@ -941,6 +1049,7 @@ execute_batch_search(BktreeBatchJoinState *state)
 {
 	BatchSearchState bss;
 	MemoryContext oldcxt;
+	int			firstTarget;
 
 	if (state->ntargets == 0)
 	{
@@ -954,8 +1063,6 @@ execute_batch_search(BktreeBatchJoinState *state)
 
 	/* Initialize batch search state */
 	memset(&bss, 0, sizeof(bss));
-	bss.targets = state->targets;
-	bss.ntargets = state->ntargets;
 	bss.distance = state->distance;
 	bss.index = state->index;
 	bss.max_results = 1024;
@@ -964,12 +1071,32 @@ execute_batch_search(BktreeBatchJoinState *state)
 
 	MemoryContextSwitchTo(oldcxt);
 
-	/* Execute the batch search */
-	bktree_batch_execute(&bss);
+	/*
+	 * The traversal mask holds 64 targets.  Runtime parameters can contain
+	 * more than the planner estimated, so execute consecutive 64-target
+	 * chunks instead of silently losing targets above bit 63.
+	 */
+	for (firstTarget = 0; firstTarget < state->ntargets;
+		 firstTarget += MAX_BATCH_TARGETS)
+	{
+		bss.targets = &state->targets[firstTarget];
+		bss.ntargets = Min(MAX_BATCH_TARGETS,
+							state->ntargets - firstTarget);
+		bktree_batch_execute(&bss);
+	}
 
 	/* Transfer results to our state */
 	state->results = bss.results;
 	state->nresults = bss.nresults;
+
+	/*
+	 * Heap tuples are otherwise fetched in tree traversal order.  TID order
+	 * improves locality and also makes repeated matches for one heap tuple
+	 * adjacent, allowing the executor to reuse the visibility fetch.
+	 */
+	if (state->nresults > 1)
+		qsort(state->results, state->nresults, sizeof(BatchResult),
+			  compare_batch_results_by_tid);
 }
 
 /*
@@ -1004,10 +1131,21 @@ bktree_batch_join_next(CustomScanState *node)
 		 * Fetch the heap tuple using the TID from the batch result.
 		 * We need to verify it's still visible.
 		 */
-		found = table_tuple_fetch_row_version(state->innerRel,
+		if (state->lastFetchValid &&
+			ItemPointerEquals(&state->lastFetchTid, &r->heap_tid))
+		{
+			found = state->lastFetchFound;
+		}
+		else
+		{
+			found = table_tuple_fetch_row_version(state->innerRel,
 											  &r->heap_tid,
 											  snapshot,
 											  state->innerSlot);
+			state->lastFetchTid = r->heap_tid;
+			state->lastFetchValid = true;
+			state->lastFetchFound = found;
+		}
 		if (!found)
 			continue;  /* Tuple no longer visible, skip */
 
@@ -1106,6 +1244,8 @@ bktree_batch_join_rescan(CustomScanState *node)
 	state->nresults = 0;
 	state->curr_result = 0;
 	state->search_done = false;
+	state->lastFetchValid = false;
+	state->lastFetchFound = false;
 
 	/* Rescan outer */
 	if (state->outerPlan)
